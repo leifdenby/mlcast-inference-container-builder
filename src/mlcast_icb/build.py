@@ -168,6 +168,18 @@ def model_build_args(manifest: Mapping[str, Any], base_image: str) -> dict[str, 
     """
 
     def text(key: str) -> str:
+        """Return a manifest field as a build-arg string.
+
+        Parameters
+        ----------
+        key : str
+            The manifest field.
+
+        Returns
+        -------
+        str
+            The value as a string, or ``""`` if it is missing or ``None``.
+        """
         value = manifest.get(key)
         return "" if value is None else str(value)
 
@@ -450,6 +462,25 @@ def build_image(
         check_docker(push)
 
     def build_in(context: Path) -> list[str]:
+        """Write the build context into ``context``, then build it or print how to.
+
+        Parameters
+        ----------
+        context : Path
+            The directory to write the build context into.
+
+        Returns
+        -------
+        list of str
+            The ``docker build`` command for the context.
+
+        Raises
+        ------
+        ModelError
+            If the model cannot be bundled.
+        DockerBuildError
+            If ``docker build`` fails.
+        """
         manifest = write_context(
             context,
             checkpoint=checkpoint,
@@ -597,5 +628,17 @@ def build_base(
 
 
 def _check_torch_variant(torch_variant: str) -> None:
+    """Check that ``torch_variant`` is one of :data:`TORCH_VARIANTS`.
+
+    Parameters
+    ----------
+    torch_variant : str
+        The requested torch variant.
+
+    Raises
+    ------
+    ConfigError
+        If the variant is unknown.
+    """
     if torch_variant not in TORCH_VARIANTS:
         raise ConfigError(f"Unknown torch variant {torch_variant!r}; choose one of {', '.join(TORCH_VARIANTS)}")

@@ -317,6 +317,19 @@ def manifest_summary(manifest: Mapping[str, Any]) -> dict[str, str]:
     spec = manifest.get("spec", {})
 
     def show(value: Any, unset: str = "unset") -> str:
+        """Render one manifest value as a log string.
+
+        Parameters
+        ----------
+        value : Any
+            The value; a list or tuple is joined with commas.
+        unset : str, optional
+            What to show for ``None``. Default is ``"unset"``.
+
+        Returns
+        -------
+        str
+        """
         if value is None:
             return unset
         if isinstance(value, list | tuple):

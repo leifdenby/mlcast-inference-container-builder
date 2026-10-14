@@ -37,7 +37,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -209,6 +209,19 @@ class ServeConfig:
             raise ConfigError(format_problems(f"The configuration has {len(problems)} problems:", problems))
 
         def pick(value: Any, default: Any) -> Any:
+            """Return ``value``, or ``default`` if it is ``None`` (the option was not given).
+
+            Parameters
+            ----------
+            value : Any
+                The parsed option.
+            default : Any
+                The value to use if the option was not given.
+
+            Returns
+            -------
+            Any
+            """
             return default if value is None else value
 
         return cls(
@@ -336,6 +349,7 @@ class Metrics:
     """The server's Prometheus metrics, in a registry of their own (one per app)."""
 
     def __init__(self) -> None:
+        """Create a fresh registry and register the request, inference, queue and model metrics in it."""
         self.registry = CollectorRegistry()
         self.requests = Counter(
             "mlcast_icb_requests",
@@ -385,6 +399,17 @@ class InferenceGate:
     """
 
     def __init__(self, max_queue: int, timeout: float | None, metrics: Metrics) -> None:
+        """Set up empty counters, the model lock and an initial 1 s inference-time estimate.
+
+        Parameters
+        ----------
+        max_queue : int
+            Predictions allowed to wait while one runs.
+        timeout : float or None
+            Seconds :meth:`model` waits for the lock, or ``None`` for no limit.
+        metrics : Metrics
+            Where queue depth and in-progress counts are reported.
+        """
         self.max_queue = max_queue
         self.timeout = timeout
         self.metrics = metrics
@@ -462,6 +487,7 @@ class ServerState:
     gate: InferenceGate = field(init=False)
 
     def __post_init__(self) -> None:
+        """Create the :class:`InferenceGate` from the configured queue size and request timeout."""
         self.gate = InferenceGate(self.config.max_queue, self.config.request_timeout, self.metrics)
 
 
@@ -824,7 +850,24 @@ def create_app(config: ServeConfig, loaded: LoadedModel | None = None) -> FastAP
     state = ServerState(config=config, loaded=loaded)
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):  # noqa: ARG001
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
+        """Load the model if needed, publish its info metric and start the warm-up, then serve.
+
+        Parameters
+        ----------
+        app : fastapi.FastAPI
+            The application (unused; the state is in the closure).
+
+        Yields
+        ------
+        None
+            While the app serves requests.
+
+        Raises
+        ------
+        ModelError
+            If the model bundle is missing or corrupt.
+        """
         if state.loaded is None:
             state.loaded = load_model(config)
         manifest = state.loaded.manifest
@@ -853,10 +896,24 @@ def create_app(config: ServeConfig, loaded: LoadedModel | None = None) -> FastAP
 
     @app.get("/health", tags=["health"], summary="IRENE-compatible health check")
     async def health() -> dict[str, Any]:
+        """IRENE-compatible health check.
+        \f
+        Returns
+        -------
+        dict of str to Any
+            ``status`` (always ``"ok"``) and ``model_loaded``.
+        """
         return {"status": "ok", "model_loaded": state.loaded is not None}
 
     @app.get("/healthz", tags=["health"], summary="Liveness: the process answers")
     async def healthz() -> dict[str, Any]:
+        """Liveness: the process answers.
+        \f
+        Returns
+        -------
+        dict of str to Any
+            ``{"status": "ok"}``.
+        """
         return {"status": "ok"}
 
     @app.get(
@@ -866,6 +923,14 @@ def create_app(config: ServeConfig, loaded: LoadedModel | None = None) -> FastAP
         responses={503: {"description": "Not ready yet (loading, warming up) or the warm-up failed"}},
     )
     async def readyz() -> JSONResponse:
+        """Readiness: the model is loaded and warmed up.
+        \f
+        Returns
+        -------
+        fastapi.responses.JSONResponse
+            200 ``ready`` once warmed up; otherwise 503, ``warming up`` or ``warm-up failed``
+            with the error as ``detail``.
+        """
         if state.ready.is_set():
             return JSONResponse({"status": "ready"})
         if state.warm_up_error is not None:
@@ -874,10 +939,24 @@ def create_app(config: ServeConfig, loaded: LoadedModel | None = None) -> FastAP
 
     @app.get("/metrics", tags=["health"], summary="Prometheus metrics")
     async def metrics() -> Response:
+        """Prometheus metrics.
+        \f
+        Returns
+        -------
+        fastapi.responses.Response
+            The app's metrics registry in the Prometheus text format.
+        """
         return Response(generate_latest(state.metrics.registry), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/model/info", tags=["model"], summary="Model metadata (a superset of IRENE's)")
     async def model_info() -> dict[str, Any]:
+        """Model metadata (a superset of IRENE's).
+        \f
+        Returns
+        -------
+        dict of str to Any
+            The model's metadata, or ``{"error": "Model not loaded"}`` before it is loaded.
+        """
         if state.loaded is None:
             return {"error": "Model not loaded"}
         return _model_info(state)
@@ -942,6 +1021,28 @@ def create_app(config: ServeConfig, loaded: LoadedModel | None = None) -> FastAP
             False, description="Set the forecast to NaN where the input had no valid value in any input step"
         ),
     ) -> Response:
+        """Forecast from a netCDF of past fields.
+        \f
+        Parameters
+        ----------
+        request : fastapi.Request
+            The request; its body is the upload when ``file`` is not given.
+        file : fastapi.UploadFile or None
+            The multipart upload, or ``None`` for a raw request body.
+        variable, forecast_steps, ensemble_size, format, products, quantiles, thresholds, dtype, complevel, seed, mask
+            The query parameters, as described in the OpenAPI schema.
+
+        Returns
+        -------
+        fastapi.responses.Response
+            The forecast netCDF as ``predictions.nc``, deleted once sent.
+
+        Raises
+        ------
+        fastapi.HTTPException
+            413 if the upload is too large, 422 on invalid parameters or an unusable input,
+            429 when too many predictions are in progress, 503 if the model lock timed out.
+        """
         loaded = state.loaded
         assert loaded is not None  # the lifespan has loaded it
         started = time.perf_counter()
@@ -1014,6 +1115,22 @@ def _parse_options(spec: InferenceSpec, **params: Any) -> PredictOptions:
     problems: list[str] = []
 
     def floats(raw: str, name: str, low: float | None = None, high: float | None = None) -> tuple[float, ...]:
+        """Parse a comma-separated list of numbers, appending any problem to ``problems``.
+
+        Parameters
+        ----------
+        raw : str
+            The parameter's value.
+        name : str
+            The parameter's name, for the problem messages.
+        low, high : float, optional
+            Inclusive bounds; ``None`` for no bound.
+
+        Returns
+        -------
+        tuple of float
+            The numbers, or ``()`` if they could not be parsed.
+        """
         try:
             values = tuple(float(item) for item in raw.split(",") if item.strip())
         except ValueError:
@@ -1301,10 +1418,30 @@ class _RequestMiddleware:
     """
 
     def __init__(self, app: Callable, state: ServerState) -> None:
+        """Wrap ``app``.
+
+        Parameters
+        ----------
+        app : Callable
+            The ASGI app to wrap.
+        state : ServerState
+            Holds the metrics the requests are recorded in.
+        """
         self.app = app
         self.state = state
 
     async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
+        """Handle one ASGI call; non-HTTP scopes pass straight through.
+
+        Parameters
+        ----------
+        scope : dict
+            The ASGI connection scope; the request id is stored in ``scope["state"]``.
+        receive : Callable
+            The ASGI receive channel.
+        send : Callable
+            The ASGI send channel.
+        """
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
@@ -1318,6 +1455,13 @@ class _RequestMiddleware:
         started = time.perf_counter()
 
         async def send_with_id(message: dict) -> None:
+            """Send ``message``, recording the status and adding ``X-Request-Id`` to the response start.
+
+            Parameters
+            ----------
+            message : dict
+                An ASGI send message.
+            """
             nonlocal status
             if message["type"] == "http.response.start":
                 status = message["status"]
@@ -1371,6 +1515,13 @@ class _InterceptHandler(logging.Handler):
     """Forward standard-library log records (uvicorn's) to loguru."""
 
     def emit(self, record: logging.LogRecord) -> None:
+        """Log ``record`` through loguru, at its level name if loguru knows it, else its number.
+
+        Parameters
+        ----------
+        record : logging.LogRecord
+            The standard-library record.
+        """
         try:
             level: str | int = logger.level(record.levelname).name
         except ValueError:

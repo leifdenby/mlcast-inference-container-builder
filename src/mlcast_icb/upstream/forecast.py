@@ -84,6 +84,13 @@ class ForecastInputError(ValueError):
     """
 
     def __init__(self, problems: Sequence[str]):
+        """Store the problems and build the message listing them, one per line.
+
+        Parameters
+        ----------
+        problems : Sequence[str]
+            Every problem found, each a self-contained sentence.
+        """
         self.problems = list(problems)
         super().__init__("Invalid forecast input:\n" + "\n".join(f"- {p}" for p in self.problems))
 

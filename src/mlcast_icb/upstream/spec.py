@@ -85,6 +85,23 @@ class LooseConfig:
     partial: bool = False
 
     def __getattr__(self, name: str) -> Any:
+        """Return the argument ``name``, as ``fdl.Config`` attribute access does.
+
+        Parameters
+        ----------
+        name : str
+            The argument's name.
+
+        Returns
+        -------
+        value : Any
+            The argument's value.
+
+        Raises
+        ------
+        AttributeError
+            If ``name`` is a dunder name or not one of the node's arguments.
+        """
         if name.startswith("__"):
             raise AttributeError(name)
         try:
@@ -111,6 +128,22 @@ class _LooseLoader(yaml.SafeLoader):
 
 
 def _construct_loose(loader: _LooseLoader, node: yaml.MappingNode, partial: bool) -> LooseConfig:
+    """Build a ``LooseConfig`` from a ``!fdl.Config`` or ``!fdl.Partial`` mapping node.
+
+    Parameters
+    ----------
+    loader : _LooseLoader
+        The loader reading the document.
+    node : yaml.MappingNode
+        The node; its ``__fn_or_cls__`` entry names the callable, the rest are arguments.
+    partial : bool
+        ``True`` for a ``!fdl.Partial`` node.
+
+    Returns
+    -------
+    cfg : LooseConfig
+        The node, with nested nodes constructed too.
+    """
     mapping = loader.construct_mapping(node, deep=True)
     fn_or_cls_ref = mapping.pop("__fn_or_cls__")
     return LooseConfig(
@@ -121,18 +154,74 @@ def _construct_loose(loader: _LooseLoader, node: yaml.MappingNode, partial: bool
 
 
 def _construct_loose_config(loader: _LooseLoader, node: yaml.MappingNode) -> LooseConfig:
+    """Construct a ``!fdl.Config`` node; see :func:`_construct_loose`.
+
+    Parameters
+    ----------
+    loader : _LooseLoader
+        The loader reading the document.
+    node : yaml.MappingNode
+        The ``!fdl.Config`` node.
+
+    Returns
+    -------
+    cfg : LooseConfig
+        The node, with ``partial=False``.
+    """
     return _construct_loose(loader, node, partial=False)
 
 
 def _construct_loose_partial(loader: _LooseLoader, node: yaml.MappingNode) -> LooseConfig:
+    """Construct a ``!fdl.Partial`` node; see :func:`_construct_loose`.
+
+    Parameters
+    ----------
+    loader : _LooseLoader
+        The loader reading the document.
+    node : yaml.MappingNode
+        The ``!fdl.Partial`` node.
+
+    Returns
+    -------
+    cfg : LooseConfig
+        The node, with ``partial=True``.
+    """
     return _construct_loose(loader, node, partial=True)
 
 
 def _construct_loose_type(loader: _LooseLoader, node: yaml.ScalarNode) -> LooseType:
+    """Construct a ``!type`` node without importing the class it names.
+
+    Parameters
+    ----------
+    loader : _LooseLoader
+        The loader reading the document.
+    node : yaml.ScalarNode
+        The ``!type`` node, holding ``"module.QualName"``.
+
+    Returns
+    -------
+    t : LooseType
+        The class's name.
+    """
     return LooseType(name=loader.construct_scalar(node))
 
 
 def _construct_tagged_value(loader: _LooseLoader, node: yaml.MappingNode) -> None:
+    """Refuse a ``!fdl.TaggedValue`` node, which mlcast configs do not use.
+
+    Parameters
+    ----------
+    loader : _LooseLoader
+        The loader reading the document.
+    node : yaml.MappingNode
+        The ``!fdl.TaggedValue`` node.
+
+    Raises
+    ------
+    NotImplementedError
+        Always.
+    """
     raise NotImplementedError("fdl.TaggedValue nodes are not supported in mlcast configs.")
 
 
@@ -146,6 +235,20 @@ _LooseLoader.add_constructor("!fdl.TaggedValue", _construct_tagged_value)
 # registers the same representer on import; it is repeated here so that dumping a config
 # that contains a class does not require importing the orchestrator (and the loggers).
 def _type_representer(dumper: yaml.SafeDumper, data: type) -> yaml.ScalarNode:
+    """Represent a class as a ``!type`` scalar of its fully qualified name.
+
+    Parameters
+    ----------
+    dumper : yaml.SafeDumper
+        The dumper writing the document.
+    data : type
+        The class.
+
+    Returns
+    -------
+    node : yaml.ScalarNode
+        ``!type module.QualName``.
+    """
     return dumper.represent_scalar("!type", f"{data.__module__}.{data.__qualname__}")
 
 
@@ -326,6 +429,15 @@ class InferenceSpec:
     mlcast_commit: str | None
 
     def __post_init__(self) -> None:
+        """Turn ``standard_names`` and ``units`` into tuples and validate the fields.
+
+        Raises
+        ------
+        ValueError
+            If there are no standard names, the number of units differs from it, a step
+            count, the spatial divisor or the ensemble size is below 1, or ``timestep`` is
+            not an ISO 8601 duration.
+        """
         object.__setattr__(self, "standard_names", tuple(self.standard_names))
         object.__setattr__(self, "units", tuple(self.units))
         if len(self.standard_names) == 0:
