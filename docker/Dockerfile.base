@@ -1,0 +1,217 @@
+# syntax=docker/dockerfile:1
+
+# The runtime base image: Python, torch, the pinned mlcast and this package (`run` and
+# `serve`), every dependency exactly as uv.lock pins it, and no model. Model images add
+# one layer on top (docker/Dockerfile.model, written by `mlcast-icb build`).
+#
+# One image per builder release and torch variant, selected with TORCH_EXTRA, which is
+# one of the project's torch extras:
+#
+#   docker build -f docker/Dockerfile.base --build-arg TORCH_EXTRA=gpu-cu126 .
+#
+# or `mlcast-icb build-base --torch gpu-cu126`, which also tags it with the name
+# `mlcast-icb build` looks for and passes the label build args. The build context is
+# the repository root, with docker/Dockerfile.base.dockerignore applied.
+#
+# No HEALTHCHECK: Docker's healthcheck is ignored by Kubernetes, which probes `serve`
+# through its own liveness/readiness probes (/healthz, /readyz), and a batch `run` has
+# nothing to probe.
+
+ARG TORCH_EXTRA=cpu
+# The container's Python, installed by uv (a uv-managed CPython, not the distro's).
+ARG PYTHON_VERSION=3.12
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.9.16
+
+FROM ${UV_IMAGE} AS uv
+
+# ---------------------------------------------------------------------------------
+# Build stage: the two wheels that are not plain registry downloads, and the torch
+# requirements. This is where .git is needed — hatch-vcs derives the version from the
+# git tag, and mlcast is a git dependency — and also where it stays: only the wheels and
+# a requirements file are copied forward, so the runtime image needs no git.
+# ---------------------------------------------------------------------------------
+FROM python:${PYTHON_VERSION}-slim-trixie AS build
+
+ARG TORCH_EXTRA
+# Optional checks, set by CI and `mlcast-icb build-base`: the build fails if the wheel's
+# version is not EXPECTED_VERSION (a release tag), or if uv.lock pins another mlcast
+# commit than MLCAST_COMMIT (the one the image is labelled with).
+ARG EXPECTED_VERSION=""
+ARG MLCAST_COMMIT=""
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=uv /uv /usr/local/bin/uv
+
+WORKDIR /src
+COPY . .
+
+# This package. Print what the tag resolves to before building: a clone without tags
+# yields a bare dev version, and a version ending in .dYYYYMMDD means the checkout looked
+# modified (an uncommitted change, or a tracked path left out by the .dockerignore).
+RUN git describe --tags --dirty --always \
+    && uv build --wheel --out-dir /dist \
+    && ls -la /dist \
+    && if [ -n "$EXPECTED_VERSION" ]; then \
+         ls /dist | grep -q "^mlcast_inference_container_builder-${EXPECTED_VERSION#v}-" \
+         || { echo "wheel version does not match EXPECTED_VERSION=$EXPECTED_VERSION" >&2; exit 1; }; \
+       fi
+
+# mlcast, at the commit uv.lock pins, built into a wheel here so the runtime stage does
+# not need git. A full clone, as mlcast's version also comes from its tags; the build
+# fails unless the wheel's version is the one uv.lock records.
+RUN set -eu; \
+    set -- $(python docker/lockinfo.py mlcast); url=$1; commit=$2; version=$3; \
+    echo "mlcast $version from $url@$commit"; \
+    if [ -n "$MLCAST_COMMIT" ] && [ "$MLCAST_COMMIT" != "$commit" ]; then \
+      echo "uv.lock pins mlcast $commit, not MLCAST_COMMIT=$MLCAST_COMMIT" >&2; exit 1; \
+    fi; \
+    git clone --quiet "$url" /tmp/mlcast; \
+    git -C /tmp/mlcast checkout --quiet "$commit"; \
+    uv build --wheel --out-dir /dist /tmp/mlcast; \
+    ls /dist | grep -q "^mlcast-${version}-" \
+      || { echo "built mlcast wheel is not version $version:" >&2; ls /dist >&2; exit 1; }
+
+# torch and what only it needs (torchvision, triton, the CUDA libraries as nvidia-* and
+# cuda-* wheels), cut out of uv.lock with their hashes, for the runtime stage's torch
+# layer. PyPI comes first and the variant's PyTorch index (read from pyproject.toml, so it
+# is defined once) second; unsafe-best-match lets each pin come from whichever index has
+# it, which is safe here because --require-hashes accepts only the locked files. The
+# export's "# via" comments are dropped: they reflect the whole lock, so they can change
+# when these pins have not, and would rebuild the torch layer for nothing.
+RUN uv export --quiet --frozen --no-emit-project --extra ${TORCH_EXTRA} --output-file /tmp/all.txt \
+    && index=$(python docker/lockinfo.py torch-index ${TORCH_EXTRA}) \
+    && { echo "--extra-index-url $index"; \
+         awk '/^[^ #-]/ { keep = /^(torch|torchvision|triton|nvidia-[a-z0-9-]+|cuda-(bindings|pathfinder|toolkit))==/ && !/^nvidia-ml-py==/ } keep && !/^ *#/' /tmp/all.txt; } \
+       > /torch.txt \
+    && grep -E '^(--|[a-z])' /torch.txt
+
+# ---------------------------------------------------------------------------------
+# Operating system per torch variant; only the one named by TORCH_EXTRA is built.
+#
+# GPU variants use the CUDA -base image, not -runtime: the torch wheel brings its own
+# CUDA libraries as nvidia-* pip packages, so -runtime's system copies of cuBLAS, cuFFT,
+# NCCL and the rest (a 1.4 GB layer) would only duplicate them. -base still carries what
+# GPU access needs: the NVIDIA_* variables the container toolkit reads to mount the host
+# driver, and the NVIDIA_REQUIRE_CUDA driver check. Each CUDA version matches the
+# cuda-toolkit that uv.lock pins for the extra, so that check asks the host driver for
+# exactly what torch was built against. Anything added later that links against system
+# CUDA libraries instead of shipping its own would need -runtime back.
+#
+# A GPU image requires a GPU: started without one, `run` exits 4 instead of quietly
+# running on CPU. Pass DEVICE=cpu (or auto) to run it without a GPU.
+# ---------------------------------------------------------------------------------
+FROM debian:trixie-slim AS os-cpu
+
+FROM nvidia/cuda:12.6.3-base-ubuntu24.04 AS os-gpu-cu126
+ENV DEVICE=cuda
+
+FROM nvidia/cuda:12.8.1-base-ubuntu24.04 AS os-gpu-cu128
+ENV DEVICE=cuda
+
+FROM nvidia/cuda:13.0.3-base-ubuntu24.04 AS os-gpu-cu130
+ENV DEVICE=cuda
+
+# ---------------------------------------------------------------------------------
+# Runtime stage: the locked dependencies, then the two wheels.
+# ---------------------------------------------------------------------------------
+FROM os-${TORCH_EXTRA} AS runtime
+
+ARG TORCH_EXTRA
+ARG PYTHON_VERSION
+# The non-torch extras installed. `remote` brings the s3fs backend for s3:// stores,
+# `serve` the HTTP server's dependencies.
+ARG EXTRAS="remote serve"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    VIRTUAL_ENV=/opt/venv \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON_INSTALL_DIR=/opt/python \
+    # The cache is a mount, on another filesystem than the venv, so uv cannot hardlink.
+    UV_LINK_MODE=copy \
+    # Compile .pyc at install time: the venv is read-only to the runtime user, so Python
+    # could not cache them itself, and every cold start (one per `run`) would pay for
+    # compiling torch's and mlcast's imports again.
+    UV_COMPILE_BYTECODE=1 \
+    # The CUDA wheels are hundreds of MB each; uv's 30s default times out on them.
+    UV_HTTP_TIMEOUT=300 \
+    PATH=/opt/venv/bin:$PATH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=uv /uv /usr/local/bin/uv
+
+# uv fetches its own standalone CPython, so every variant gets the same Python whatever
+# the distro ships.
+RUN uv python install ${PYTHON_VERSION} \
+    && uv venv --python ${PYTHON_VERSION} ${VIRTUAL_ENV}
+
+# torch first, as its own layer: about 3 GB for a GPU variant, and it changes far less
+# often than anything else. Its pins come from uv.lock (see the build stage), and Docker
+# caches this layer by their content alone, so a lock update that leaves torch alone does
+# not rebuild it, and a node that already has it does not pull it again.
+COPY --from=build /torch.txt /tmp/torch.txt
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --no-deps --require-hashes --index-strategy unsafe-best-match -r /tmp/torch.txt
+
+# Then every other dependency, exactly as uv.lock pins it. torch is already installed at
+# the locked versions, so uv sync keeps it and adds the rest. mlcast is skipped here
+# (installing it from git would need git in this image) and installed from the build
+# stage's wheel below. Only pyproject.toml and uv.lock are mounted in, so this layer
+# rebuilds when the lock changes, not on every commit. --frozen installs the lock as is;
+# CI's --locked fails a stale lock.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=pyproject.toml,target=/tmp/lock/pyproject.toml \
+    --mount=type=bind,source=uv.lock,target=/tmp/lock/uv.lock \
+    cd /tmp/lock \
+    && uv sync --frozen --no-install-project --no-install-package mlcast --python ${PYTHON_VERSION} \
+        --extra ${TORCH_EXTRA} $(for extra in ${EXTRAS}; do printf -- '--extra %s ' "$extra"; done)
+
+# Finally mlcast and this package: small layers that rebuild on every commit. Their
+# dependencies are all in place already; pip check confirms the wheels agree with them.
+COPY --from=build /dist/*.whl /tmp/wheels/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --no-deps /tmp/wheels/*.whl \
+    && rm -rf /tmp/wheels \
+    && uv pip check \
+    && mlcast-icb --version
+
+# uid 1000, the uid model images give /model to. Ubuntu 24.04 (the CUDA bases) already
+# has an `ubuntu` user with it.
+RUN if id -u ubuntu >/dev/null 2>&1; then userdel --remove ubuntu; fi \
+    && useradd --create-home --uid 1000 model
+USER 1000
+WORKDIR /home/model
+
+# Where model images put the bundle; `run`, `serve` and `info` read it from here.
+ENV MODEL_DIR=/model
+
+# `serve` listens here.
+EXPOSE 8000
+
+# No default CMD: every container states its mode (`run`, `serve`, `info`). A forgotten
+# subcommand then prints the usage and exits 2 at once, where a default `serve` would
+# leave a batch Job that forgot `run` serving forever instead of failing.
+ENTRYPOINT ["mlcast-icb"]
+
+# Label values only, passed by `mlcast-icb build-base` (or CI). Declared last, so changing
+# them never invalidates a layer above.
+ARG BUILDER_VERSION=unknown
+ARG MLCAST_VERSION=unknown
+ARG MLCAST_COMMIT=unknown
+LABEL org.opencontainers.image.title="mlcast-inference-runtime" \
+      org.opencontainers.image.description="mlcast inference runtime (run, serve); model images add /model" \
+      org.opencontainers.image.source="https://github.com/mlcast-community/mlcast-inference-container-builder" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${BUILDER_VERSION}" \
+      io.github.mlcast-community.builder.version="${BUILDER_VERSION}" \
+      io.github.mlcast-community.mlcast.version="${MLCAST_VERSION}" \
+      io.github.mlcast-community.mlcast.commit="${MLCAST_COMMIT}" \
+      io.github.mlcast-community.torch.variant="${TORCH_EXTRA}" \
+      io.github.mlcast-community.python.version="${PYTHON_VERSION}"

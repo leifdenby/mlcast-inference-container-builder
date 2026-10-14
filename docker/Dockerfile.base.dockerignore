@@ -1,0 +1,27 @@
+# Applied to docker/Dockerfile.base only (BuildKit reads <Dockerfile>.dockerignore next to
+# the Dockerfile before the context root's .dockerignore). The context is the repo root.
+#
+# .git is deliberately NOT ignored: hatch-vcs derives the version from the git tag in
+# the build stage, and the multi-stage build keeps it out of the runtime image.
+#
+# Only ignore paths git ignores too (see .gitignore). Leaving out a tracked path makes the
+# build stage's checkout look modified, and hatch-vcs then stamps the version with a
+# date: a v0.1.0 build comes out as 0.1.0.post1.dev0+d20261001.
+.venv
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+build
+dist
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+**/*.ckpt
+**/*.safetensors
+**/*.zarr
+**/*.nc
+scratch
+data
+**/.DS_Store

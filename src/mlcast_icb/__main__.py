@@ -1,8 +1,8 @@
-"""Command line: ``mlcast-icb {run,serve,bundle,info}``.
+"""Command line: ``mlcast-icb {run,serve,bundle,info,build,build-base}``.
 
 ``run`` and ``serve`` are what an image executes; they take no options, since a
-container is configured through its environment. ``bundle`` and ``info`` are build-time
-tools, configured through options.
+container is configured through its environment. ``bundle``, ``info``, ``build`` and
+``build-base`` are build-time tools, configured through options.
 """
 
 from __future__ import annotations
@@ -42,7 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Forecast from INPUT_ZARR into OUTPUT_ZARR. Configured entirely by environment variables; "
         "see the README.",
     )
-    sub.add_parser("serve", help="HTTP server (not implemented yet)")
+    sub.add_parser(
+        "serve",
+        help="HTTP server, IRENE-compatible (configured by environment variables)",
+        description="Serve forecasts over HTTP (POST /predict with a netCDF). Configured entirely by environment "
+        "variables; see the README. Needs the `serve` extra.",
+    )
 
     bundle = sub.add_parser(
         "bundle",
@@ -65,7 +70,62 @@ def build_parser() -> argparse.ArgumentParser:
         "model_dir", nargs="?", help="bundle directory (default: $MODEL_DIR, or /model when that is unset)"
     )
     info.add_argument("--verify", action="store_true", help="also check the checksum and load the model on CPU")
+
+    _add_build_parsers(sub)
     return parser
+
+
+def _add_build_parsers(sub: argparse._SubParsersAction) -> None:
+    """Add the ``build`` and ``build-base`` subcommands."""
+    from mlcast_icb.build import DEFAULT_TORCH_VARIANT, RUNTIME_IMAGE_REPOSITORY, TORCH_VARIANTS
+
+    build = sub.add_parser(
+        "build",
+        help="build a model image: a bundle on top of the runtime base image",
+        description="Bundle a checkpoint (verifying it with a strict reload and one CPU forward pass), or take an "
+        "existing bundle, and build an image that is the runtime base image plus the bundle at /model.",
+    )
+    source = build.add_mutually_exclusive_group(required=True)
+    source.add_argument("--checkpoint", help="the trained (or converted) mlcast checkpoint to bundle")
+    source.add_argument("--bundle", help="an existing bundle directory (from `mlcast-icb bundle`) to use as is")
+    build.add_argument(
+        "--config", help="the training config YAML; needed unless the checkpoint embeds an inference spec"
+    )
+    build.add_argument("--timestep", help="time between steps as an ISO 8601 duration, e.g. PT5M")
+    build.add_argument("--name", help="model name, recorded in the manifest and the image labels")
+    build.add_argument("--model-version", help="model version, recorded in the manifest and the image labels")
+    build.add_argument("--tag", required=True, help="image reference to build, e.g. registry.example.com/irene:1.0")
+    build.add_argument(
+        "--base-image",
+        help=f"runtime base image (default: {RUNTIME_IMAGE_REPOSITORY}:<builder version>-<torch variant>)",
+    )
+    build.add_argument(
+        "--torch",
+        choices=TORCH_VARIANTS,
+        default=DEFAULT_TORCH_VARIANT,
+        help="torch variant of the default base image (default: %(default)s)",
+    )
+    build.add_argument("--platform", help="target platform, e.g. linux/amd64 (default: the Docker host's)")
+    build.add_argument("--push", action="store_true", help="push the image (docker buildx build --push)")
+    build.add_argument(
+        "--context-only",
+        metavar="DIR",
+        help="write the build context to DIR and print the build command, without building (no Docker needed)",
+    )
+
+    base = sub.add_parser(
+        "build-base",
+        help="build the runtime base image from this source checkout",
+        description="Build docker/Dockerfile.base for one torch variant, tagged as `build` expects by default.",
+    )
+    base.add_argument(
+        "--torch", choices=TORCH_VARIANTS, default=DEFAULT_TORCH_VARIANT, help="torch variant (default: %(default)s)"
+    )
+    base.add_argument("--tag", help="image reference (default: the one `build` uses for this variant)")
+    base.add_argument("--platform", help="target platform, e.g. linux/amd64 (default: the Docker host's)")
+    base.add_argument("--push", action="store_true", help="push the image (docker buildx build --push)")
+    base.add_argument("--expected-version", help="fail unless the package builds as this version (a release tag)")
+    base.add_argument("--dry-run", action="store_true", help="print the docker command instead of running it")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -80,7 +140,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     -------
     int
         0 on success, a code from :mod:`mlcast_icb.errors` on a known failure, 2 for a
-        usage error or ``serve`` (not implemented yet), 1 for anything unexpected.
+        usage error, 1 for anything unexpected.
     """
     parser = build_parser()
     try:
@@ -92,6 +152,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         from mlcast_icb.run import main as run_main
 
         return run_main()
+    if args.command == "serve":
+        from mlcast_icb.serve import main as serve_main
+
+        return serve_main()
 
     from mlcast_icb.logs import configure_logging
 
@@ -99,13 +163,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command is None:
         parser.print_help(sys.stderr)
         return ConfigError.exit_code
-    if args.command == "serve":
-        logger.error("serve is not implemented yet; use run")
-        return ConfigError.exit_code
-
     try:
         if args.command == "bundle":
             return _bundle(args)
+        if args.command == "build":
+            return _build(args)
+        if args.command == "build-base":
+            return _build_base(args)
         return _info(args)
     except MlcastIcbError as exc:
         logger.error(f"{exc}")
@@ -145,6 +209,43 @@ def _info(args: argparse.Namespace) -> int:
     else:
         manifest = read_manifest(model_dir)
     print(json.dumps(manifest, indent=2))
+    return 0
+
+
+def _build(args: argparse.Namespace) -> int:
+    """Build a model image (or write its context) from the ``build`` subcommand's options."""
+    from mlcast_icb.build import build_image
+
+    logger.info(f"{DISTRIBUTION} {__version__}: building a model image")
+    build_image(
+        args.tag,
+        checkpoint=args.checkpoint,
+        bundle=args.bundle,
+        config=args.config,
+        timestep=args.timestep,
+        name=args.name,
+        model_version=args.model_version,
+        base_image=args.base_image,
+        torch_variant=args.torch,
+        platform=args.platform,
+        push=args.push,
+        context_only=args.context_only,
+    )
+    return 0
+
+
+def _build_base(args: argparse.Namespace) -> int:
+    """Build the runtime base image from the ``build-base`` subcommand's options."""
+    from mlcast_icb.build import build_base
+
+    build_base(
+        args.tag,
+        args.torch,
+        platform=args.platform,
+        push=args.push,
+        expected_version=args.expected_version,
+        dry_run=args.dry_run,
+    )
     return 0
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -77,9 +78,10 @@ def test_info_on_a_missing_bundle_exits_6(tmp_path: Path) -> None:
     assert main(["info", str(tmp_path / "nothing")]) == 6
 
 
-def test_serve_is_not_implemented_yet(capsys: pytest.CaptureFixture[str]) -> None:
+def test_serve_reads_the_environment(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("PORT", "not-a-port")
     assert main(["serve"]) == 2
-    assert "not implemented yet" in capsys.readouterr().err
+    assert "PORT must be an integer" in capsys.readouterr().err
 
 
 def test_no_command_prints_help_and_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
@@ -105,7 +107,12 @@ def test_run_reads_the_environment(monkeypatch: pytest.MonkeyPatch, capsys: pyte
 
 def test_module_entry_point_returns_the_exit_code() -> None:
     result = subprocess.run(
-        [sys.executable, "-m", "mlcast_icb", "serve"], capture_output=True, text=True, check=False, timeout=120
+        [sys.executable, "-m", "mlcast_icb", "serve"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+        env={**os.environ, "MAX_QUEUE": "-1"},
     )
     assert result.returncode == 2
-    assert "not implemented yet" in result.stderr
+    assert "MAX_QUEUE must be at least 0" in result.stderr

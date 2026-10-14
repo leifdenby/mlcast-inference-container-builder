@@ -1,4 +1,4 @@
-"""Shared test fixtures: tiny trained models and checkpoints, and the opt-in IRENE tests."""
+"""Shared test fixtures: tiny trained models and checkpoints, and the opt-in IRENE and Docker tests."""
 
 import os
 from dataclasses import dataclass
@@ -17,6 +17,8 @@ from mlcast.models.convgru import ConvGruModel
 
 #: Set to 1 to run the slow tests on the real IRENE checkpoint (like ``--run-irene``).
 IRENE_ENV = "MLCAST_ICB_IRENE"
+#: Set to 1 to run the tests that build and run images with Docker (like ``--run-docker``).
+DOCKER_ENV = "MLCAST_ICB_DOCKER"
 
 TINY_INPUT_STEPS = 3
 TINY_FORECAST_STEPS = 2
@@ -31,15 +33,32 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help=f"run the slow tests on the real IRENE checkpoint (or set {IRENE_ENV}=1)",
     )
+    parser.addoption(
+        "--run-docker",
+        action="store_true",
+        default=False,
+        help=f"run the tests that build and run images with Docker (or set {DOCKER_ENV}=1)",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers", f"docker: builds and runs images with a local Docker daemon; run with --run-docker or {DOCKER_ENV}=1"
+    )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    if config.getoption("--run-irene") or os.environ.get(IRENE_ENV) == "1":
-        return
-    skip = pytest.mark.skip(reason=f"IRENE test; run with --run-irene or {IRENE_ENV}=1")
-    for item in items:
-        if "irene" in item.keywords:
-            item.add_marker(skip)
+    opt_in = {
+        "irene": (config.getoption("--run-irene") or os.environ.get(IRENE_ENV) == "1", "--run-irene", IRENE_ENV),
+        "docker": (config.getoption("--run-docker") or os.environ.get(DOCKER_ENV) == "1", "--run-docker", DOCKER_ENV),
+    }
+    for marker, (enabled, option, env) in opt_in.items():
+        if enabled:
+            continue
+        skip = pytest.mark.skip(reason=f"{marker} test; run with {option} or {env}=1")
+        for item in items:
+            if marker in item.keywords:
+                item.add_marker(skip)
 
 
 @dataclass(frozen=True)

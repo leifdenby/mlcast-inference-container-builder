@@ -1,0 +1,38 @@
+# check=skip=InvalidDefaultArgInFrom
+# (BASE_IMAGE has no default on purpose: a build without it must fail, not pick a base.)
+#
+# A model image: the runtime base plus one layer, the model bundle at /model.
+#
+# `mlcast-icb build` copies this file into a build context next to `bundle/` (model.ckpt
+# and manifest.json) and passes every ARG below, read from the bundle's manifest. With
+# `--context-only` it prints the command instead, for kaniko, buildah or a CI system
+# without a Docker daemon; any builder that takes --build-arg works.
+#
+# No `# syntax=` line: nothing here needs a newer Dockerfile frontend, and leaving it out
+# keeps the build from fetching one, so it works offline and with any builder.
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG BASE_IMAGE
+ARG MODEL_NAME=""
+ARG MODEL_VERSION=""
+ARG MODEL_SHA256=""
+ARG MODEL_CREATED=""
+ARG MODEL_MLCAST_VERSION=""
+ARG MODEL_BUILDER_VERSION=""
+
+# The base image's io.github.mlcast-community.* labels (builder, mlcast and torch
+# versions) are inherited; these say which model is on top and what made its bundle.
+LABEL org.opencontainers.image.title="${MODEL_NAME}" \
+      org.opencontainers.image.version="${MODEL_VERSION}" \
+      org.opencontainers.image.description="mlcast nowcasting model ${MODEL_NAME} ${MODEL_VERSION}" \
+      org.opencontainers.image.base.name="${BASE_IMAGE}" \
+      io.github.mlcast-community.model.name="${MODEL_NAME}" \
+      io.github.mlcast-community.model.version="${MODEL_VERSION}" \
+      io.github.mlcast-community.model.sha256="${MODEL_SHA256}" \
+      io.github.mlcast-community.model.created="${MODEL_CREATED}" \
+      io.github.mlcast-community.model.mlcast-version="${MODEL_MLCAST_VERSION}" \
+      io.github.mlcast-community.model.builder-version="${MODEL_BUILDER_VERSION}"
+
+COPY --chown=1000:1000 bundle/ /model/

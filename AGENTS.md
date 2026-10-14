@@ -35,8 +35,12 @@ tests/
 
 ## Conventions
 
-- Use `uv` for everything; see README.md for the commands. Pass `--extra cpu --extra dev`
-  to `uv run` as well as `uv sync`.
+- Use `uv` for everything; see README.md for the commands. Pass
+  `--extra cpu --extra remote --extra serve --extra dev` to `uv run` as well as `uv sync`;
+  without them uv syncs the environment down and tests are skipped or fail.
+- Never prefix shell commands with `cd ... &&`; pass absolute paths (`uv run --directory`,
+  `git -C`). For ad-hoc Python, write a script file and run it rather than using heredocs
+  or long `python -c` strings.
 - Ruff settings match mlcast's (line length 120). Run `ruff format` rather than
   hand-wrapping.
 - Versioning is `hatch-vcs` from the git tag; never hardcode a version.
