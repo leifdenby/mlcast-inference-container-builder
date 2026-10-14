@@ -1,0 +1,144 @@
+[build-system]
+build-backend = "hatchling.build"
+requires = [ "hatch-vcs", "hatchling" ]
+
+[project]
+name = "mlcast-inference-container-builder"
+description = "Turn a trained mlcast nowcasting model into a ready-to-run inference container image"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "Leif Denby", email = "lcd@dmi.dk" },
+]
+# Same floor as the pinned mlcast.
+requires-python = ">=3.11"
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dynamic = [ "version" ]
+# torch is not a core dependency, mirroring mlcast: it comes in through exactly one of the
+# `cpu` / `gpu-*` extras below, each mapped to its own PyTorch index in [tool.uv.sources].
+dependencies = [
+  "beartype>=0.18",
+  "jaxtyping>=0.2",
+  "loguru>=0.7.3",
+  # Pinned to an exact commit via [tool.uv.sources]; see the "Pinned mlcast version" table
+  # in README.md. Bumping it means cutting a new builder release.
+  "mlcast",
+  "numpy>=2.2.6",
+]
+
+# The torch extras mirror mlcast's own: same names, same contents, same index mapping.
+# They repeat mlcast's extras rather than depending on `mlcast[cpu]` etc., because uv
+# would then also apply mlcast's per-extra torch sources, whose extras are not declared
+# as conflicting in this project, and refuse to resolve.
+optional-dependencies.cpu = [
+  "pytorch-lightning>=2",
+  "torch>=2.7.1",
+  "torchvision>=0.20",
+]
+optional-dependencies.dev = [
+  "pytest>=8",
+  "ruff>=0.8",
+]
+optional-dependencies.gpu-cu126 = [
+  "pytorch-lightning>=2",
+  "torch>=2.7.1",
+  "torchvision>=0.20",
+]
+optional-dependencies.gpu-cu128 = [
+  "pytorch-lightning>=2",
+  "torch>=2.7.1",
+  "torchvision>=0.20",
+]
+optional-dependencies.gpu-cu130 = [
+  "pytorch-lightning>=2",
+  "torch>=2.7.1",
+  "torchvision>=0.20",
+]
+
+# Version comes from the git tag (e.g. v0.1.0 -> 0.1.0). There are no tags yet, hence the
+# fallback.
+[tool.hatch.version]
+source = "vcs"
+fallback-version = "0.0.0"
+
+[tool.hatch.build.targets.wheel]
+packages = [ "src/mlcast_icb" ]
+
+[tool.ruff]
+# Same settings as mlcast, so modules in mlcast_icb/upstream/ can move there unchanged.
+line-length = 120
+
+format.indent-style = "space"
+format.quote-style = "double"
+format.line-ending = "auto"
+format.skip-magic-trailing-comma = false
+# Code blocks in the Markdown docs are API sketches with aligned comments, not code.
+format.exclude = [ "*.md" ]
+# Sort mlcast as first-party, as it is inside mlcast, so upstream/ modules and their tests
+# keep the same import blocks after the move.
+lint.isort.known-first-party = [ "mlcast", "mlcast_icb" ]
+lint.select = [
+  "B",  # flake8-bugbear
+  "E",  # pycodestyle errors
+  "F",  # pyflakes
+  "I",  # isort
+  "UP", # pyupgrade
+  "W",  # pycodestyle warnings
+]
+# jaxtyping shape strings (e.g. "time height width") are not forward annotations.
+lint.ignore = [ "F722" ]
+
+[tool.pytest.ini_options]
+testpaths = [ "tests" ]
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "cpu" },
+    { extra = "gpu-cu126" },
+    { extra = "gpu-cu128" },
+    { extra = "gpu-cu130" },
+  ],
+]
+
+[tool.uv.sources]
+# upstream/main of mlcast-community/mlcast.
+mlcast = { git = "https://github.com/mlcast-community/mlcast", rev = "5edce0756410ecdd963b2a5ba85e3afc6a0a532b" }
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu126", extra = "gpu-cu126" },
+  { index = "pytorch-cu128", extra = "gpu-cu128" },
+  { index = "pytorch-cu130", extra = "gpu-cu130" },
+]
+torchvision = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu126", extra = "gpu-cu126" },
+  { index = "pytorch-cu128", extra = "gpu-cu128" },
+  { index = "pytorch-cu130", extra = "gpu-cu130" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
