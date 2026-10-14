@@ -9,8 +9,9 @@ with and extending the IRENE server on Hugging Face (`it4lia/irene`, FBK), that 
 netCDF and returns a forecast netCDF.
 
 **Decisions:** scope is mlcast models only. One image carries both modes: build `run`
-first, then `serve`. Upstream PRs to mlcast are in scope, but the builder still has to
-support existing checkpoints. Each builder release pins one exact mlcast version.
+first, then `serve`. Upstream PRs to mlcast and other repos come **only after a full
+working prototype**. Until then, all mlcast-facing code and fixes (e.g. PR H's padding)
+live in `mlcast_icb/upstream/`, and the builder works with existing checkpoints. Each builder release pins one exact mlcast version.
 
 ## Verdict: both modes are feasible; they share one core
 Both modes reduce to `xr.Dataset (past) -> model -> xr.Dataset (forecast)`. Only the I/O

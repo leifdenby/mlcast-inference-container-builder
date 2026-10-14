@@ -17,6 +17,9 @@ Rules for this subpackage:
   becomes a one-line re-export (e.g. `from mlcast.inference import forecast`). It is
   deleted once nothing in the builder imports it.
 
+These PRs will be opened only once the builder works end to end as a prototype. Until
+then, fixes such as PR H are applied here, inside the builder.
+
 File and line references below are to mlcast at commit `5edce07`.
 
 ## Overview
