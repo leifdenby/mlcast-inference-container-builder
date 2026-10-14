@@ -64,6 +64,11 @@ knows the scaling.
 **Tests.** A forecast on an odd-sized domain matches, inside the original domain, the same
 forecast with the input pre-padded with 0 mm/h.
 
+**In the builder.** `forecast.py` (PR D) pads with `scaling.norm_min` itself before calling
+the network, so the network never pads. `test_forecast.py::test_odd_domain_pads_with_no_rain`
+is the test above, and also checks that the network's own padding would give a different
+forecast.
+
 ---
 
 ## PR C — Shared pre/post-processing
@@ -280,20 +285,33 @@ def forecast(
     model: NowcastLightningModule,
     spec: InferenceSpec,
     ds: xr.Dataset,
+    *,
     forecast_steps: int | None = None,   # default: spec.forecast_steps
     ensemble_size: int | None = None,    # default: spec.default_ensemble_size
     seed: int | None = None,
+    reference_time: np.datetime64 | None = None,  # default: the last time in ds
 ) -> xr.Dataset:
     ...
+
+class ForecastInputError(ValueError):   # lists every problem with the input at once
+    problems: list[str]
 ```
 
 It covers:
 
-- finding time/y/x by CF attributes, reusing `_detect_axes`
-  (`data/source_data_datasets.py:84-127`), and selecting variables by standard name;
-- checking the time spacing against `spec.timestep`, and taking the last `input_steps`;
-- unit checks/conversion; `preprocess`/`postprocess` from PR C;
-- padding to `spec.spatial_divisor` and cropping back;
+- finding time/y/x by CF attributes, like `_detect_axes`
+  (`data/source_data_datasets.py:84-127`), and selecting variables by standard name
+  (`rainfall_rate` and `rainfall_flux` may stand in for each other). Unlike `_detect_axes`
+  it also accepts `latitude`/`longitude` coordinates (cf_xarray gives them no `Y`/`X` axis)
+  and reports an error instead of guessing `y`/`x`. It is mirrored rather than imported,
+  since `source_data_datasets` drags in pyarrow and the samplers;
+- taking the `input_steps` times ending at `reference_time` and checking their spacing
+  against `spec.timestep` (or, if that is `None`, that they are evenly spaced);
+- unit checks/conversion (equivalent spellings such as `mm/h`; `kg m-2 s-1` ↔ `mm h-1`
+  by 3600; missing units are assumed with a warning); `preprocess`/`postprocess` from PR C;
+- padding to `spec.spatial_divisor` with `scaling.norm_min` after normalising (bottom and
+  right, as the network does), so the network's own padding never runs (PR H), and
+  cropping back;
 - CF output: dims `(ensemble_member, time, y, x)`, with valid `time`,
   `forecast_reference_time`, `lead_time`, the input's x/y coordinates and `grid_mapping`
   carried through, and `standard_name`/`units` on each variable.
