@@ -40,6 +40,8 @@ dependencies = [
   "zarr>=3",
 ]
 
+scripts.mlcast-icb = "mlcast_icb.__main__:main"
+
 # The torch extras mirror mlcast's own: same names, same contents, same index mapping.
 # They repeat mlcast's extras rather than depending on `mlcast[cpu]` etc., because uv
 # would then also apply mlcast's per-extra torch sources, whose extras are not declared
