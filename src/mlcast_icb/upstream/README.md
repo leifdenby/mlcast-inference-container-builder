@@ -156,34 +156,65 @@ longer importable (`__main__.CombinedDatasetFactory`, the removed
 ```python
 @dataclass(frozen=True)
 class InferenceSpec:
-    standard_names: list[str]
-    units: list[str]
+    standard_names: tuple[str, ...]
+    units: tuple[str, ...]              # from UNITS, e.g. rainfall_rate -> "mm h-1"
     scaling: ReflectivityScaling        # per model; per channel if that is ever needed
     input_steps: int
     forecast_steps: int
-    timestep: str                       # ISO 8601 duration, e.g. "PT5M"
-    spatial_divisor: int                # 2**num_blocks for ConvGru
-    default_ensemble_size: int
-    network_config: str                 # Fiddle YAML of cfg.pl_module.network
-    mlcast_version: str
+    timestep: str | None                # ISO 8601 duration, e.g. "PT5M"; None if unknown
+    spatial_divisor: int                # 2**num_blocks for ConvGru, else 1
+    default_ensemble_size: int          # cfg.pl_module.ensemble_size
+    network_config: str                 # Fiddle YAML (dump_yaml) of cfg.pl_module.network
+    mlcast_version: str                 # of the mlcast that created the spec
     mlcast_commit: str | None
 
-    def to_dict(self) -> dict[str, Any]: ...
+    def to_dict(self) -> dict[str, Any]: ...    # JSON-able, plus "format_version"
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "InferenceSpec": ...
 
-def spec_from_config(cfg: fdl.Config) -> InferenceSpec:
+def spec_from_config(cfg: fdl.Config | LooseConfig, timestep: str | None = None) -> InferenceSpec:
     """Read the spec from a training config, touching cfg.data only as plain values."""
 
+def load_config_loose(path) -> LooseConfig: ...     # read a YAML config, importing nothing
+def to_buildable(value) -> fdl.Config | ...: ...    # resolve a loose subtree into real fdl configs
+
 # checkpoint.py
+INFERENCE_SPEC_KEY = "mlcast_inference"
 def save_inference_metadata(checkpoint: dict[str, Any], spec: InferenceSpec) -> None: ...
-def load_model(checkpoint_path: str, config_path: str | None = None,
-               device: str = "cpu") -> tuple[NowcastLightningModule, InferenceSpec]: ...
+def load_inference_metadata(checkpoint: dict[str, Any]) -> InferenceSpec | None: ...
+def build_network(spec: InferenceSpec) -> torch.nn.Module: ...
+def load_model(checkpoint_path, config_path=None, device: str = "cpu",
+               timestep: str | None = None) -> tuple[NowcastLightningModule, InferenceSpec]: ...
 ```
 
 `load_model` uses the spec stored in the checkpoint when it is there, and otherwise falls
 back to the YAML (building only `cfg.pl_module.network`, never the full `Experiment`). The
-fallback keeps existing checkpoints working.
+fallback keeps existing checkpoints working. It loads the checkpoint once
+(`weights_only=False`, like `from_checkpoint`), builds `NowcastLightningModule(network,
+**hyper_parameters)`, calls `on_load_checkpoint` and then `load_state_dict(strict=True)`,
+which is what Lightning's `load_from_checkpoint` does.
+
+Notes from the implementation:
+
+- **Loose YAML loading.** `mlcast.config.loader.load_yaml_config` cannot be used here:
+  importing it runs `mlcast/config/__init__.py`, which imports the orchestrator and with
+  it mlflow; and it imports every class in the file, so it fails on real training configs
+  (checked on a `version_24/config.yaml` that references `__main__.CombinedDatasetFactory`
+  and `mlcast.sampling.samplers`; a copy is in `tests/data/`). `spec.py` therefore has its
+  own loader that reads `!fdl.Config`/`!fdl.Partial`/`!type` nodes as plain data
+  (`LooseConfig`/`LooseType`); only `pl_module.network` is resolved with `to_buildable`.
+  `spec.py` also registers the `!type` YAML representer itself (the same one the
+  orchestrator registers), so dumping a network config needs no orchestrator import.
+  Importing `spec`/`checkpoint` imports neither mlflow, tensorboard, wandb nor
+  `mlcast.config` (tested); matplotlib still comes in through `mlcast.visualization`.
+- **Timestep.** Training configs do not record it, so a spec read from a YAML has
+  `timestep=None` unless given (`spec_from_config(cfg, timestep=)`, `load_model(...,
+  timestep=)`). A self-describing checkpoint can carry it.
+- **Combined datasets.** If `data.dataset_factory` has a `dataset_factories` mapping, its
+  members are read; they must agree on `input_steps`/`forecast_steps`. If their
+  `standard_names` differ (version_24 has `rainfall_amount` and `rainfall_flux`, which look
+  the same to the network after normalisation), the first member's are used, with a warning.
+- **Scaling** is always `DEFAULT_SCALING`, since configs do not record one.
 
 **Changes in mlcast.**
 
@@ -196,7 +227,10 @@ fallback keeps existing checkpoints working.
 
 **Tests.** Train one step on synthetic data; `from_checkpoint(path)` with no other
 argument reloads strictly and gives identical output; an old-style checkpoint still loads
-through `load_model(ckpt, config)`.
+through `load_model(ckpt, config)`. Implemented in `tests/upstream/test_spec.py` and
+`test_checkpoint.py`, using a tiny `ConvGruModel` trained for two steps by a Lightning
+`Trainer` (fixture `tiny_trained_model` in `tests/conftest.py`, with `config.yaml` written by
+the orchestrator's own `_log_experiment_config_yaml_file`).
 
 ---
 
@@ -323,10 +357,33 @@ whose `EncoderDecoder` has the same module tree as mlcast's `ConvGruModel`
 real-world integration-test model.
 
 **What it does.** Read the checkpoint's hyperparameters (`input_channels`, `num_blocks`,
-`noisy_decoder`, `ensemble_size`, `forecast_steps`), rename `model.*` state-dict keys to
-`network.*`, drop optimizer state, and write an mlcast checkpoint with an `InferenceSpec`
-(with PR A) or a checkpoint plus a matching Fiddle YAML (without it). Strict loading is
-checked as part of the conversion.
+`noisy_decoder`, `ensemble_size`, `forecast_steps`, loss and optimizer), rename `model.*`
+state-dict keys to `network.*`, drop optimizer, scheduler, loop and callback state, and write:
+
+- `model.ckpt`: a stripped `NowcastLightningModule` checkpoint (`state_dict`, the four
+  `hyper_parameters` the module saves, `pytorch-lightning_version`, a `converted_from`
+  record) with the `InferenceSpec` under `mlcast_inference` (omit with `--no-embed-spec`).
+  It holds only tensors and plain values, so it loads with `weights_only=True`, and
+  `NowcastLightningModule.load_from_checkpoint(path, network=net, strict=True)` works.
+- `config.yaml`: a full training config, `training_experiment` with the network, loss,
+  optimizer/scheduler and `data.dataset_factory` (`standard_names`, `input_steps`,
+  `forecast_steps`, `return_mask`) set, dumped as training does. It passes
+  `validate_config` and loads with mlcast's `load_yaml_config`; data paths are mlcast's
+  placeholders.
+
+```sh
+python -m mlcast_icb.upstream.convert_convgru_ensemble <src.ckpt | hf://it4lia/irene> <out_dir> \
+    [--standard-name rainfall_rate] [--input-steps 6] [--timestep PT5M] [--no-embed-spec]
+```
+
+`input_steps` and the timestep are not in `convgru_ensemble` checkpoints, so they are
+arguments (IRENE's 6 and `PT5M` by default). The source is read with `weights_only=True`,
+allowing only the `torch.optim` classes its hyperparameters pickle. After writing, the
+conversion checks that the weights load strictly, reload unchanged through `load_model`,
+and that the spec read from `config.yaml` equals the embedded one. `hf://` sources need
+`huggingface_hub` (in the `dev` extra here). Unlike `spec.py` and `checkpoint.py`, this
+module imports `mlcast.config` (and so the orchestrator and mlflow), since it writes a
+training config. On IRENE it writes a 256.7 MB checkpoint from the 770 MB source.
 
 **Verified on IRENE** (mlcast `5edce07`):
 - Removing the `model.` prefix (bare network) or replacing it with `network.` (Lightning
@@ -346,7 +403,12 @@ padding). Outside the floor, end-to-end mm/h agree to 5e-4.
 
 **Tests.** Convert a tiny synthetic `convgru_ensemble`-shaped checkpoint; the result loads
 strictly and matches the original forward pass for the same seed. The full IRENE
-conversion runs as a slow, opt-in test.
+conversion runs as a slow, opt-in test (marker `irene`; `pytest --run-irene` or
+`MLCAST_ICB_IRENE=1`; `MLCAST_ICB_IRENE_CKPT` / `MLCAST_ICB_IRENE_SAMPLE` point it at local
+files, otherwise they come from the Hugging Face cache). FBK's package cannot be a test
+dependency, so it compares the converted network with the raw IRENE weights loaded straight
+into `ConvGruModel` (bit-identical, 2 members × 12 steps on a 256×256 crop of
+`sample_data.nc`) and checks that the forecast is plausible rain.
 
 **Data caveat.** IRENE's `examples/sample_data.nc` labels `RR` as `units: kg m-2 s-1` with
 `standard_name: tprate`, but the values are mm/h (max 111). It also points at a
