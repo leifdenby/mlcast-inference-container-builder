@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import runpy
 import shlex
@@ -14,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import xarray as xr
+from loguru import logger
 from run_testdata import write_input
 
 import mlcast_icb.build as build_module
@@ -74,11 +76,17 @@ class FakeDocker:
     def __init__(self, daemon_up: bool = True, build_returncode: int = 0) -> None:
         self.daemon_up = daemon_up
         self.build_returncode = build_returncode
+        #: Labels of the images in the local store, by reference; others are not present.
+        self.local_images: dict[str, dict[str, str]] = {}
         self.calls: list[list[str]] = []
         self.context_files: list[str] = []
 
     def __call__(self, argv, **kwargs) -> subprocess.CompletedProcess:
         self.calls.append(list(argv))
+        if argv[:3] == ["docker", "image", "inspect"]:
+            if argv[-1] in self.local_images:
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(self.local_images[argv[-1]]) + "\n")
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr=f"Error: No such image: {argv[-1]}\n")
         if argv[:2] == ["docker", "version"]:
             if self.daemon_up:
                 return subprocess.CompletedProcess(argv, 0, stdout="29.0.0\n", stderr="")
@@ -250,6 +258,39 @@ def test_build_defaults_to_this_builders_base_image(bundle_dir: Path, fake_docke
     assert f"BASE_IMAGE={default_base_image('gpu-cu128')}" in command
 
 
+@pytest.fixture
+def warnings_logged() -> Iterator[list[str]]:
+    messages: list[str] = []
+    handler = logger.add(lambda message: messages.append(str(message)), level="WARNING")
+    yield messages
+    logger.remove(handler)
+
+
+def test_build_warns_when_the_local_base_image_has_another_mlcast(
+    bundle_dir: Path, fake_docker: FakeDocker, warnings_logged: list[str]
+) -> None:
+    fake_docker.local_images["base:1"] = {"io.github.mlcast-community.mlcast.version": "0.0.1"}
+    command = build_image("reg/m:1", bundle=bundle_dir, base_image="base:1")
+    assert ["docker", "image", "inspect", "--format", "{{json .Config.Labels}}", "base:1"] in fake_docker.calls
+    assert fake_docker.calls[-1] == command, "a mismatch warns, it does not stop the build"
+    assert len(warnings_logged) == 1
+    assert "mlcast 0.0.1" in warnings_logged[0] and "base:1" in warnings_logged[0]
+
+
+@pytest.mark.parametrize("labels", [None, {}, {"io.github.mlcast-community.mlcast.version": "unknown"}, "same"])
+def test_build_does_not_warn_without_a_mismatch(
+    labels, bundle_dir: Path, fake_docker: FakeDocker, warnings_logged: list[str]
+) -> None:
+    # Given a base image that is not local (None), has no mlcast label, an unknown one, or the bundle's
+    if labels == "same":
+        manifest = json.loads((bundle_dir / MANIFEST_FILE).read_text())
+        labels = {"io.github.mlcast-community.mlcast.version": manifest["mlcast_version"]}
+    if labels is not None:
+        fake_docker.local_images["base:1"] = labels
+    build_image("reg/m:1", bundle=bundle_dir, base_image="base:1")
+    assert warnings_logged == []
+
+
 def test_push_needs_buildx_and_pushes(bundle_dir: Path, fake_docker: FakeDocker) -> None:
     command = build_image("reg/m:1", bundle=bundle_dir, base_image="base:1", push=True)
     assert ["docker", "buildx", "version"] in fake_docker.calls
@@ -348,7 +389,12 @@ def test_cli_build_without_docker_exits_2(
 
 # --- real images (opt-in) -------------------------------------------------------------
 
-TEST_BASE_IMAGE = "mlcast-icb-test-runtime:cpu"
+#: Set to a cpu base image already built from this checkout (with the labels
+#: ``build_base_command`` passes) to test on it instead of building one. CI builds it
+#: beforehand with buildx and the GitHub Actions cache; the tests leave it in place.
+PREBUILT_BASE_ENV = "MLCAST_ICB_TEST_BASE_IMAGE"
+PREBUILT_BASE_IMAGE = os.environ.get(PREBUILT_BASE_ENV)
+TEST_BASE_IMAGE = PREBUILT_BASE_IMAGE or "mlcast-icb-test-runtime:cpu"
 TEST_MODEL_IMAGE = "mlcast-icb-test-model:tiny"
 
 
@@ -361,16 +407,20 @@ def model_image(bundle_dir: Path) -> Iterator[str]:
     """The cpu runtime base built from this checkout, and the tiny model on top of it.
 
     Both tags are removed afterwards; the base's layers stay in Docker's build cache, so
-    the next run rebuilds it in seconds unless uv.lock or the code changed.
+    the next run rebuilds it in seconds unless uv.lock or the code changed. With
+    ``MLCAST_ICB_TEST_BASE_IMAGE`` set, that base image is used as is and kept.
     """
     if shutil.which("docker") is None:
         pytest.fail("--run-docker needs the docker command")
+    built = [TEST_MODEL_IMAGE]
     try:
-        subprocess.run(build_base_command(REPO, TEST_BASE_IMAGE, "cpu"), check=True)
+        if PREBUILT_BASE_IMAGE is None:
+            built.append(TEST_BASE_IMAGE)
+            subprocess.run(build_base_command(REPO, TEST_BASE_IMAGE, "cpu"), check=True)
         build_image(TEST_MODEL_IMAGE, bundle=bundle_dir, base_image=TEST_BASE_IMAGE)
         yield TEST_MODEL_IMAGE
     finally:
-        docker("image", "rm", TEST_MODEL_IMAGE, TEST_BASE_IMAGE, check=False)
+        docker("image", "rm", *built, check=False)
 
 
 @pytest.mark.docker

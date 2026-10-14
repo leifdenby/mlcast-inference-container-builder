@@ -5,11 +5,14 @@ Turns a trained [mlcast](https://github.com/mlcast-community/mlcast) nowcasting 
 offers two modes: `run` (batch, zarr in/out on S3) and `serve` (an HTTP server compatible
 with the IRENE API).
 
-Status: early. Model bundles (`bundle`, `info`), the batch mode (`run`) and the HTTP
-server (`serve`) work, and so do the image builds (`build-base`, `build`). No base image
-is published yet, so build it locally first (see [Building images](#building-images)).
+Status: working prototype, not yet released. Model bundles (`bundle`, `info`), the batch
+mode (`run`), the HTTP server (`serve`) and the image builds (`build-base`, `build`) all
+work and are tested, including in Docker and on the real IRENE checkpoint. Base images
+are published to ghcr.io from the first version tag on; until then, build one locally
+first (see [Building images](#building-images)).
 
 - [PLAN.md](PLAN.md) — feasibility, design and build order.
+- [CHANGELOG.md](CHANGELOG.md) — what changed, release by release.
 - [src/mlcast_icb/upstream/README.md](src/mlcast_icb/upstream/README.md) — code written to
   move into mlcast, one proposed PR at a time.
 
@@ -226,6 +229,9 @@ version and commit, torch variant) are inherited.
   first.
 - Without a docker command or a reachable daemon, `build` exits 2 and suggests
   `--context-only`.
+- If the base image is already in the local image store and its mlcast version label
+  differs from the bundle's, `build` logs a warning: the model may not load in that
+  runtime. A base image that is not local is not pulled just for this check.
 
 **Without a Docker daemon** (kaniko, buildah, a locked-down CI runner), use
 `--context-only DIR`. It writes the context (`Dockerfile.model` and `bundle/`) and prints
@@ -296,22 +302,44 @@ Each builder release corresponds to one mlcast version, and so does each base im
 `pytest --run-docker` (or `MLCAST_ICB_DOCKER=1`) also runs the Docker tests. They build
 the cpu base image and a tiny model image on it, then check `info`, the labels and the
 missing-subcommand exit, and that `run` in the container matches a local run. The base
-build takes about 4 minutes cold and seconds from cache.
+build takes about 4 minutes cold and seconds from cache. With
+`MLCAST_ICB_TEST_BASE_IMAGE=<image>` they use that already built cpu base image instead,
+as CI does.
 
 ## Development
 
 ```sh
-uv sync --extra cpu --extra serve --extra dev
-uv run --extra cpu --extra serve --extra dev pytest
-uv run --extra cpu --extra serve --extra dev ruff check .
-uv run --extra cpu --extra serve --extra dev ruff format --check .
+uv sync --extra cpu --extra remote --extra serve --extra dev
+uv run --extra cpu --extra remote --extra serve --extra dev pytest
+uv run --extra cpu --extra remote --extra serve --extra dev ruff check .
+uv run --extra cpu --extra remote --extra serve --extra dev ruff format --check .
 ```
 
-The `serve` extra is needed for `tests/test_serve.py`.
+The `serve` extra is needed for `tests/test_serve.py`, `remote` for the S3 tests.
 
 torch is chosen by exactly one of the `cpu`, `gpu-cu126`, `gpu-cu128` and `gpu-cu130`
 extras, mirroring mlcast's own extras. Pass the same `--extra` flags to `uv run`, or it
 re-syncs without them.
+
+## CI
+
+GitHub Actions, in [`.github/workflows/`](.github/workflows):
+
+| Workflow / job | When | What |
+| --- | --- | --- |
+| `ci.yml` lint | every PR and push to `main` | `uv lock --check`, then ruff (the locked version) `check` and `format --check` |
+| `ci.yml` test | every PR and push to `main` | `uv sync --locked` with the `cpu`, `remote`, `serve` and `dev` extras, then `pytest`, on Python 3.11 and the container's Python (read from `docker/Dockerfile.base`) |
+| `ci.yml` irene | push to `main`, weekly, on demand | the `--run-irene` tests on the real IRENE checkpoint; the Hugging Face cache is kept between runs, keyed on IRENE's revision |
+| `ci.yml` docker | PRs and pushes to `main` that change `docker/`, `src/`, `pyproject.toml`, `uv.lock` or the Docker tests; weekly; on demand | builds the cpu base image with buildx (cached in GitHub Actions), then runs the `--run-docker` tests on it; nothing is pushed |
+| `publish-image.yml` | a version tag `vX.Y.Z…` | builds the base image for every torch variant, smoke-tests it, and pushes it to `ghcr.io/mlcast-community/mlcast-inference-runtime` as `<version>-<variant>`, plus `<major>.<minor>-<variant>` and `latest-<variant>` for final releases (cpu for linux/amd64 and linux/arm64, GPU variants for linux/amd64) |
+| `dependabot-changelog.yml` | Dependabot PRs | records the update in [CHANGELOG.md](CHANGELOG.md) |
+
+Dependabot ([`.github/dependabot.yml`](.github/dependabot.yml)) proposes updates to the
+GitHub Actions, `uv.lock` (except mlcast, which is bumped by hand with a release) and the
+CUDA base images (patch releases only).
+
+To release, tag in canonical PEP 440 form (`v0.1.0`, `v0.2.0rc1`) and push the tag. The
+build fails unless the package builds as exactly the tag's version.
 
 ## Pinned mlcast version
 

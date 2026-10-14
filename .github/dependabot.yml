@@ -1,0 +1,46 @@
+version: 2
+updates:
+- package-ecosystem: github-actions
+  directory: /.github/workflows
+  schedule:
+    interval: quarterly
+  cooldown:
+    default-days: 7
+  groups:
+    gha-patches:
+      update-types:
+      - patch
+
+# uv.lock. Every merged update changes what a release's base image contains, so they are
+# grouped into one PR a month rather than trickling in.
+- package-ecosystem: uv
+  directory: /
+  schedule:
+    interval: monthly
+  cooldown:
+    default-days: 7
+  ignore:
+  # Pinned to an exact commit in [tool.uv.sources]; bumping it means a new builder
+  # release, the README's version table and a re-check of upstream/README.md (AGENTS.md).
+  - dependency-name: mlcast
+  groups:
+    python-minor-and-patch:
+      update-types:
+      - minor
+      - patch
+
+# docker/Dockerfile.base. Only literal FROM lines are tracked: the uv and python images
+# are selected through ARGs (UV_IMAGE, PYTHON_VERSION), which are bumped by hand.
+- package-ecosystem: docker
+  directory: /docker
+  schedule:
+    interval: monthly
+  cooldown:
+    default-days: 7
+  ignore:
+  # Each CUDA base matches the cuda-toolkit that uv.lock pins for its torch extra, so
+  # only patch releases may move it on their own.
+  - dependency-name: nvidia/cuda
+    update-types:
+    - version-update:semver-major
+    - version-update:semver-minor

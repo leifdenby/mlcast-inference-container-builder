@@ -1,0 +1,240 @@
+name: Publish image
+
+# Builds, smoke-tests and pushes the runtime base image for every torch variant, on a
+# version tag only. The tags are the ones `mlcast-icb build` looks for
+# (default_base_image() in src/mlcast_icb/build.py), one set per variant:
+#
+#   v0.1.0     -> 0.1.0-<variant>, 0.1-<variant>, latest-<variant>
+#   v0.2.0rc1  -> 0.2.0rc1-<variant> only (pre-, post- and dev releases never move latest)
+#
+# Tag in canonical PEP 440 form (v0.2.0rc1, not v0.2.0-rc1): the Dockerfile compares
+# EXPECTED_VERSION with the built wheel's version literally, and `build` names the base
+# image after the normalised version.
+#
+# Platforms: cpu is built for linux/amd64 and linux/arm64, so `mlcast-icb build` on an
+# Apple Silicon Mac or an arm64 server gets a native base image. The GPU variants are
+# linux/amd64 only. uv.lock does have aarch64 CUDA wheels, but GPU arm64 hosts (Grace
+# Hopper and the like) are rare for nowcasting, each GPU image is several GB, and
+# building one under QEMU emulation would take a large part of the job's time limit for
+# an image nobody has asked for yet. Add linux/arm64 to a variant's `platforms` below to
+# publish it.
+#
+# The pull_request and main-branch builds of the image happen in ci.yml (the docker job,
+# cpu only); this workflow only runs for releases.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+# A release is never cancelled half-pushed; a re-pushed tag waits for the first run.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      # One variant failing does not stop the others; re-run the failed job once fixed.
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cpu
+            platforms: linux/amd64,linux/arm64
+            torch: "+cpu"
+          - variant: gpu-cu126
+            platforms: linux/amd64
+            torch: "+cu126"
+          - variant: gpu-cu128
+            platforms: linux/amd64
+            torch: "+cu128"
+          - variant: gpu-cu130
+            platforms: linux/amd64
+            torch: "+cu130"
+    env:
+      # The image that is smoke-tested, before anything is pushed.
+      LOCAL_IMAGE: mlcast-inference-runtime:smoke-${{ matrix.variant }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The image version comes from the git tag via hatch-vcs, which needs the
+          # history and tags. Without them it does not fail but produces a bogus version,
+          # which EXPECTED_VERSION then catches.
+          fetch-depth: 0
+
+      - name: Free disk space
+        # A GPU variant is built twice over (in the builder, then loaded into the daemon
+        # for the smoke test) with several GB of CUDA wheels each time; the runner's free
+        # space is not enough without removing toolchains this job does not use.
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          docker system prune --all --force
+          df -h /
+
+      - name: Read the image name and the locked mlcast
+        # The repository is defined once, as RUNTIME_IMAGE_REPOSITORY in build.py, which
+        # is where `mlcast-icb build` takes it from.
+        id: info
+        run: |
+          image=$(sed -n 's/^RUNTIME_IMAGE_REPOSITORY = "\(.*\)"$/\1/p' src/mlcast_icb/build.py)
+          if [ -z "$image" ]; then
+            echo "::error::no 'RUNTIME_IMAGE_REPOSITORY = \"...\"' line in src/mlcast_icb/build.py"
+            exit 1
+          fi
+          registry=${image%%/*}
+          owner=$(echo "$image" | cut -d/ -f2)
+          repository_owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          if [ "$owner" != "$repository_owner" ]; then
+            echo "::error::$image is not under $GITHUB_REPOSITORY_OWNER, so this repository's GITHUB_TOKEN cannot push it"
+            exit 1
+          fi
+          # shellcheck disable=SC2046 # "<git url> <commit> <version>", split on purpose
+          set -- $(python3 docker/lockinfo.py mlcast)
+          {
+            echo "image=$image"
+            echo "registry=$registry"
+            echo "mlcast_commit=$2"
+            echo "mlcast_version=$3"
+            # The package version the tag stands for, as the image labels record it.
+            echo "version=${GITHUB_REF_NAME#v}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        # Only for the variants that are built for another architecture as well.
+        if: contains(matrix.platforms, 'arm64')
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.info.outputs.image }}
+          # pep440 rather than semver: hatch-vcs versions are PEP 440, and a tag such as
+          # v0.2.0rc1 is not valid semver, so it would yield no image tag at all.
+          # {{major}}.{{minor}} is skipped for pre-releases, and latest=auto adds latest
+          # for final releases only. The suffix names the variant on every tag, latest
+          # included (onlatest), so each variant has its own latest-<variant>.
+          tags: |
+            type=pep440,pattern={{version}}
+            type=pep440,pattern={{major}}.{{minor}}
+          flavor: |
+            latest=auto
+            suffix=-${{ matrix.variant }},onlatest=true
+
+      - name: Check the tags are the ones `mlcast-icb build` looks for
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          EXPECTED: ${{ steps.info.outputs.image }}:${{ steps.info.outputs.version }}-${{ matrix.variant }}
+        run: |
+          echo "Tags:"
+          echo "$TAGS"
+          if [ -z "$TAGS" ]; then
+            echo "::error::${GITHUB_REF_NAME} is not a PEP 440 version, so there is nothing to tag the image with"
+            exit 1
+          fi
+          if ! echo "$TAGS" | grep -qxF "$EXPECTED"; then
+            echo "::error::none of the tags is $EXPECTED, the image default_base_image() names for this release; tag in canonical PEP 440 form"
+            exit 1
+          fi
+
+      - name: Build
+        # linux/amd64 only, loaded into the local daemon rather than pushed, so the smoke
+        # test runs against exactly this image before any of it reaches the registry. A
+        # multi-platform image cannot be loaded; the Push step builds the other
+        # platforms. EXPECTED_VERSION fails the build unless the package is the tag's
+        # version.
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.base
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.LOCAL_IMAGE }}
+          # Keep build-args and labels identical in the Push step.
+          build-args: |
+            TORCH_EXTRA=${{ matrix.variant }}
+            EXPECTED_VERSION=${{ github.ref_name }}
+            BUILDER_VERSION=${{ steps.info.outputs.version }}
+            MLCAST_VERSION=${{ steps.info.outputs.mlcast_version }}
+            MLCAST_COMMIT=${{ steps.info.outputs.mlcast_commit }}
+          # The Dockerfile sets the other labels; metadata-action's would overwrite its
+          # title and version with the repository's name and the suffixed tag.
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          # Reads the cache ci.yml's docker job writes for cpu; a GPU scope is never
+          # written (a release-only, several-GB torch layer would evict the CI cache), so
+          # it simply misses.
+          cache-from: type=gha,scope=base-${{ matrix.variant }}
+          provenance: false
+
+      - name: Smoke test the image
+        # The version is the tag's, the entrypoint runs, a missing subcommand exits 2,
+        # the locked mlcast is installed, and torch is the variant's build. GPU behaviour
+        # needs a GPU runner.
+        env:
+          VERSION: ${{ steps.info.outputs.version }}
+          MLCAST_VERSION: ${{ steps.info.outputs.mlcast_version }}
+          TORCH_SUFFIX: ${{ matrix.torch }}
+        run: |
+          set -u
+          printed=$(docker run --rm "$LOCAL_IMAGE" --version)
+          echo "$printed"
+          if [ "$printed" != "mlcast-inference-container-builder $VERSION" ]; then
+            echo "::error::the image reports '$printed', not version $VERSION"
+            exit 1
+          fi
+
+          docker run --rm "$LOCAL_IMAGE" && got=0 || got=$?
+          if [ "$got" -ne 2 ]; then
+            echo "::error::without a subcommand the image exited $got, not 2"
+            exit 1
+          fi
+
+          docker run --rm -e MLCAST_VERSION -e TORCH_SUFFIX --entrypoint python "$LOCAL_IMAGE" -c '
+          import os
+          from importlib.metadata import version
+          import torch
+          import mlcast_icb.serve, mlcast_icb.run  # every mode imports
+
+          print("torch", torch.__version__, "mlcast", version("mlcast"))
+          assert torch.__version__.endswith(os.environ["TORCH_SUFFIX"]), torch.__version__
+          assert version("mlcast") == os.environ["MLCAST_VERSION"], version("mlcast")
+          '
+
+      - name: Log in to the container registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ steps.info.outputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        # Same inputs as the Build step, in the same job, so linux/amd64 comes from the
+        # builder's local cache: this pushes the image that was just tested rather than
+        # building a new one. Other platforms are built here.
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.base
+          platforms: ${{ matrix.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            TORCH_EXTRA=${{ matrix.variant }}
+            EXPECTED_VERSION=${{ github.ref_name }}
+            BUILDER_VERSION=${{ steps.info.outputs.version }}
+            MLCAST_VERSION=${{ steps.info.outputs.mlcast_version }}
+            MLCAST_COMMIT=${{ steps.info.outputs.mlcast_commit }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=base-${{ matrix.variant }}
+          provenance: false

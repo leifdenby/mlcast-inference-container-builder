@@ -1,0 +1,282 @@
+name: CI
+
+# Push only on main: a branch with an open PR is covered by the pull_request run, and
+# pushing on every branch as well would run each commit twice. Branches without a PR get
+# no CI.
+#
+#   lint, test  every PR and push to main (and the weekly run)
+#   irene       push to main, weekly and on demand: downloads the 770 MB IRENE checkpoint,
+#               so not on PRs
+#   docker      PRs and pushes to main that change what goes into the image, weekly and
+#               on demand; it builds the cpu base image but never pushes it (only
+#               publish-image.yml does, on a version tag)
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Mondays 04:23 UTC. Catches an IRENE update on Hugging Face, or a base image that no
+    # longer builds (apt, the OS bases), when nothing in this repository changed.
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  # Per event as well as per ref, so a push to main never cancels the weekly run on main.
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  setup:
+    name: Versions and changes
+    runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.versions.outputs.python }}
+      uv: ${{ steps.versions.outputs.uv }}
+      image: ${{ steps.changes.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The whole history, so the changes step can diff against the PR base or the
+          # commit before the push.
+          fetch-depth: 0
+
+      - name: Read the container's Python and uv versions
+        # Read from the Dockerfile, so CI always tests exactly what the image runs, and
+        # checks the lock with the uv that the image installs it with.
+        id: versions
+        run: |
+          python=$(sed -n 's/^ARG PYTHON_VERSION=//p' docker/Dockerfile.base)
+          uv=$(sed -n 's|^ARG UV_IMAGE=ghcr.io/astral-sh/uv:||p' docker/Dockerfile.base)
+          if [ -z "$python" ] || [ -z "$uv" ]; then
+            echo "::error::no 'ARG PYTHON_VERSION=' or 'ARG UV_IMAGE=ghcr.io/astral-sh/uv:' line in docker/Dockerfile.base"
+            exit 1
+          fi
+          echo "Container Python $python, uv $uv"
+          echo "python=$python" >> "$GITHUB_OUTPUT"
+          echo "uv=$uv" >> "$GITHUB_OUTPUT"
+
+      - name: Did anything that goes into the image change?
+        # A job-level path filter: GitHub's own `paths` filter applies to a whole
+        # workflow, and would skip lint and test as well. The paths are what the base
+        # image is built from (docker/Dockerfile.base.dockerignore leaves out nothing
+        # tracked), plus the Docker tests and this workflow.
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          paths="docker/ pyproject.toml uv.lock src/ tests/conftest.py tests/test_build.py .github/workflows/ci.yml"
+          if [ "$EVENT" = schedule ] || [ "$EVENT" = workflow_dispatch ]; then
+            echo "$EVENT: building regardless of changes"
+            image=true
+          elif [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            # A new branch (before is all zeros) or a force push whose old head is gone.
+            echo "Cannot diff against '$BASE'; building to be safe"
+            image=true
+          else
+            # Three dots for a PR (what the PR changes since it branched off); for a push,
+            # everything between the old and the new head.
+            if [ "$EVENT" = pull_request ]; then range="$BASE...$GITHUB_SHA"; else range="$BASE..$GITHUB_SHA"; fi
+            # shellcheck disable=SC2086 # $paths is a list of pathspecs
+            changed=$(git diff --name-only "$range" -- $paths)
+            if [ -n "$changed" ]; then
+              echo "Image inputs changed in $range:"
+              echo "$changed"
+              image=true
+            else
+              echo "No image inputs changed in $range"
+              image=false
+            fi
+          fi
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+  lint:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        # Exact version: since v8, setup-uv publishes no floating major tags.
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: ${{ needs.setup.outputs.uv }}
+          python-version: ${{ needs.setup.outputs.python }}
+
+      - name: Check the lock is up to date
+        run: uv lock --check
+
+      - name: Lint and check formatting
+        # ruff at the version uv.lock pins, without installing the project (and torch)
+        # just to lint it.
+        run: |
+          ruff=$(uv export --frozen --extra cpu --extra dev --no-hashes --no-annotate --no-header | sed -n 's/^ruff==//p')
+          if [ -z "$ruff" ]; then
+            echo "::error::uv.lock pins no ruff in the dev extra"
+            exit 1
+          fi
+          uvx "ruff@$ruff" check .
+          uvx "ruff@$ruff" format --check .
+
+  test:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # "container" is the image's own Python, read from docker/Dockerfile.base, so one
+        # job always tests exactly what the container runs: that Python with the locked
+        # dependencies. 3.11 is the oldest the project (and the pinned mlcast) supports.
+        python: ["container", "3.11"]
+    name: test (Python ${{ matrix.python == 'container' && needs.setup.outputs.python || matrix.python }})
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # hatch-vcs reads the version from the git tag, so the full history and tags
+          # have to be present or the build reports a bogus version.
+          fetch-depth: 0
+
+      - name: Install uv and Python
+        # Creates .venv and puts it on PATH for every later step; the cache key comes
+        # from uv.lock.
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: ${{ needs.setup.outputs.uv }}
+          python-version: ${{ matrix.python == 'container' && needs.setup.outputs.python || matrix.python }}
+          activate-environment: true
+          enable-cache: true
+
+      - name: Install from the lock
+        # --locked fails if uv.lock has fallen behind pyproject.toml. The cpu extra is the
+        # torch build the cpu image gets; the GPU path needs a GPU runner.
+        run: uv sync --locked --extra cpu --extra remote --extra serve --extra dev
+
+      - name: Test
+        # The irene and docker tests are opt-in, and run in their own jobs below.
+        run: pytest -q
+
+  irene:
+    # Not on PRs: the IRENE checkpoint is a 770 MB download. The Hugging Face cache is
+    # kept between runs, so it is downloaded again only when IRENE changes.
+    if: github.event_name != 'pull_request'
+    needs: setup
+    runs-on: ubuntu-latest
+    env:
+      IRENE_REPO: it4lia/irene
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: ${{ needs.setup.outputs.uv }}
+          python-version: ${{ needs.setup.outputs.python }}
+          activate-environment: true
+          enable-cache: true
+
+      - name: Install from the lock
+        run: uv sync --locked --extra cpu --extra remote --extra serve --extra dev
+
+      - name: Resolve IRENE's current revision
+        # The tests download the head of IRENE's main branch (hf://it4lia/irene), so the
+        # cache is keyed on the commit that is right now.
+        id: irene
+        run: |
+          revision=$(curl --fail --silent --show-error --retry 3 "https://huggingface.co/api/models/$IRENE_REPO" | jq -r .sha)
+          if [ -z "$revision" ] || [ "$revision" = null ]; then
+            echo "::error::could not read the revision of $IRENE_REPO from the Hugging Face API"
+            exit 1
+          fi
+          echo "$IRENE_REPO is at $revision"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the Hugging Face downloads
+        # A new revision restores the previous one's cache, so hf_hub_download fetches
+        # only the files that changed; the new key is then saved.
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/huggingface
+          key: huggingface-irene-${{ steps.irene.outputs.revision }}
+          restore-keys: huggingface-irene-
+
+      - name: Test on the real IRENE checkpoint
+        # Only the irene tests: the test job has run the rest.
+        run: pytest -q -m irene --run-irene
+
+  docker:
+    needs: setup
+    if: needs.setup.outputs.image == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # The tag the Docker tests look for, through MLCAST_ICB_TEST_BASE_IMAGE.
+      BASE_IMAGE: mlcast-icb-test-runtime:cpu
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The base image's build stage derives the version from the git tag
+          # (hatch-vcs), and the build context is this checkout, .git included.
+          fetch-depth: 0
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: ${{ needs.setup.outputs.uv }}
+          python-version: ${{ needs.setup.outputs.python }}
+          activate-environment: true
+          enable-cache: true
+
+      - name: Install from the lock
+        run: uv sync --locked --extra cpu --extra remote --extra serve --extra dev
+
+      - name: Read the base image's label values
+        # The same values `mlcast-icb build-base` passes (see build_base_command), so the
+        # label tests hold for this image too.
+        id: labels
+        run: |
+          # shellcheck disable=SC2046 # "<git url> <commit> <version>", split on purpose
+          set -- $(python docker/lockinfo.py mlcast)
+          {
+            echo "mlcast_commit=$2"
+            echo "mlcast_version=$3"
+            echo "builder_version=$(python -c 'import mlcast_icb; print(mlcast_icb.__version__)')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          # Leave the default builder (the Docker daemon's own) in place: the tests build
+          # the model image with plain `docker build` FROM the base image loaded below,
+          # which a docker-container builder would not see. Only the base build uses this
+          # builder, for its GitHub Actions cache.
+          use: false
+
+      - name: Build the cpu base image
+        uses: docker/build-push-action@v7
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: docker/Dockerfile.base
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.BASE_IMAGE }}
+          build-args: |
+            TORCH_EXTRA=cpu
+            BUILDER_VERSION=${{ steps.labels.outputs.builder_version }}
+            MLCAST_VERSION=${{ steps.labels.outputs.mlcast_version }}
+            MLCAST_COMMIT=${{ steps.labels.outputs.mlcast_commit }}
+          # mode=max caches the intermediate stages too, among them the ~700 MB torch
+          # layer, which then survives a lock update that leaves torch alone.
+          cache-from: type=gha,scope=base-cpu
+          cache-to: type=gha,scope=base-cpu,mode=max
+          provenance: false
+
+      - name: Test the images
+        # Builds a tiny model image on the base image and checks its labels, `info`, the
+        # missing-subcommand exit and `run` against a local run.
+        env:
+          MLCAST_ICB_TEST_BASE_IMAGE: ${{ env.BASE_IMAGE }}
+        run: pytest -q -m docker --run-docker

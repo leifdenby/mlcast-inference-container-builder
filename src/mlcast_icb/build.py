@@ -8,6 +8,8 @@
 2. copy ``docker/Dockerfile.model`` next to it;
 3. run ``docker build`` (``docker buildx build --push`` with ``push``), passing the
    manifest's identity as build args, which the Dockerfile turns into image labels.
+   If the base image is in the local image store and its mlcast version label differs
+   from the bundle's, a warning is logged first.
 
 With ``context_only`` it stops after step 2 and prints the build command, for CI systems
 without a Docker daemon (kaniko, buildah).
@@ -19,6 +21,7 @@ The runtime base image is built once per builder release and torch variant from
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import shutil
@@ -334,6 +337,63 @@ def run_docker(command: Sequence[str]) -> None:
         raise DockerBuildError(f"{command[0]} {command[1]} failed with exit code {result.returncode}; see its output")
 
 
+def local_image_labels(image: str) -> dict[str, str] | None:
+    """Return the labels of an image in the local Docker image store.
+
+    Parameters
+    ----------
+    image : str
+        The image reference.
+
+    Returns
+    -------
+    dict of str to str, or None
+        The image's labels (empty if it has none), or ``None`` if the image is not in
+        the local store, or its labels cannot be read. Nothing is pulled.
+    """
+    result = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{json .Config.Labels}}", image],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        labels = json.loads(result.stdout or "null")
+    except json.JSONDecodeError:
+        return None
+    return labels if isinstance(labels, dict) else {}
+
+
+def warn_on_mlcast_mismatch(manifest: Mapping[str, Any], base_image: str) -> None:
+    """Warn when a bundle was made with another mlcast than the base image carries.
+
+    Checked only when the base image is in the local image store; one that would be
+    pulled (or a label that is missing) is skipped silently.
+
+    Parameters
+    ----------
+    manifest : mapping
+        The bundle's ``manifest.json``.
+    base_image : str
+        The runtime base image the model image is built on.
+    """
+    labels = local_image_labels(base_image)
+    if labels is None:
+        logger.debug(f"Base image {base_image} is not available locally; not comparing mlcast versions")
+        return
+    base_version = labels.get(f"{LABEL_PREFIX}.mlcast.version")
+    bundle_version = manifest.get("mlcast_version")
+    if not base_version or base_version == "unknown" or not bundle_version or base_version == bundle_version:
+        return
+    logger.warning(
+        f"The bundle was made with mlcast {bundle_version}, but the base image {base_image} carries mlcast "
+        f"{base_version}; the model may not load there. Bundle it with the builder release that matches the base "
+        "image, or pick the base image of the builder that made the bundle."
+    )
+
+
 def build_image(
     tag: str,
     *,
@@ -406,6 +466,7 @@ def build_image(
             logger.info(f"Wrote the build context {context}; build it with:")
             print(shlex.join(command))
         else:
+            warn_on_mlcast_mismatch(manifest, base_image)
             run_docker(command)
             logger.info(f"Built {tag} on {base_image}" + (" and pushed it" if push else ""))
         return command
