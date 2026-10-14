@@ -392,7 +392,7 @@ def test_cli_build_without_docker_exits_2(
 #: Set to a cpu base image already built from this checkout (with the labels
 #: ``build_base_command`` passes) to test on it instead of building one. CI builds it
 #: beforehand with buildx and the GitHub Actions cache; the tests leave it in place.
-PREBUILT_BASE_ENV = "MLCAST_ICB_TEST_BASE_IMAGE"
+PREBUILT_BASE_ENV = "ICB_TEST_BASE_IMAGE"
 PREBUILT_BASE_IMAGE = os.environ.get(PREBUILT_BASE_ENV)
 TEST_BASE_IMAGE = PREBUILT_BASE_IMAGE or "mlcast-icb-test-runtime:cpu"
 TEST_MODEL_IMAGE = "mlcast-icb-test-model:tiny"
@@ -408,7 +408,7 @@ def model_image(bundle_dir: Path) -> Iterator[str]:
 
     Both tags are removed afterwards; the base's layers stay in Docker's build cache, so
     the next run rebuilds it in seconds unless uv.lock or the code changed. With
-    ``MLCAST_ICB_TEST_BASE_IMAGE`` set, that base image is used as is and kept.
+    ``ICB_TEST_BASE_IMAGE`` set, that base image is used as is and kept.
     """
     if shutil.which("docker") is None:
         pytest.fail("--run-docker needs the docker command")
@@ -457,18 +457,23 @@ def test_image_run_matches_a_local_run(model_image: str, bundle_dir: Path, tmp_p
     data.mkdir()
     data.chmod(0o777)  # the container runs as uid 1000
     write_input(data / "in.zarr")
-    env = {"INPUT_ZARR": "/data/in.zarr", "OUTPUT_ZARR": "/data/out.zarr", "ENSEMBLE_SIZE": "2", "SEED": "7"}
+    # Configured by MLCAST_* variables and by options, mixed, as a container would be.
+    env = {"MLCAST_INPUT_ZARR": "/data/in.zarr", "MLCAST_ENSEMBLE_SIZE": "2", "MLCAST_SEED": "7"}
     env_args = [arg for key, value in env.items() for arg in ("-e", f"{key}={value}")]
-    result = docker("run", "--rm", "-v", f"{data}:/data", *env_args, model_image, "run", check=False)
+    result = docker(
+        "run", "--rm", "-v", f"{data}:/data", *env_args, model_image, "run", "--output-zarr", "/data/out.zarr",
+        check=False,
+    )  # fmt: skip
     assert result.returncode == 0, result.stderr
+    assert "MLCAST_MODEL_DIR" in result.stderr and "/model (env)" in result.stderr  # from the image's ENV
 
     local_env = env | {
-        "INPUT_ZARR": str(data / "in.zarr"),
-        "OUTPUT_ZARR": str(tmp_path / "local.zarr"),
-        "MODEL_DIR": str(bundle_dir),
-        "DEVICE": "cpu",
+        "MLCAST_INPUT_ZARR": str(data / "in.zarr"),
+        "MLCAST_OUTPUT_ZARR": str(tmp_path / "local.zarr"),
+        "MLCAST_MODEL_DIR": str(bundle_dir),
+        "MLCAST_DEVICE": "cpu",
     }
-    assert run_main(local_env) == 0
+    assert run_main([], local_env) == 0
     in_docker = xr.open_zarr(data / "out.zarr")
     local = xr.open_zarr(tmp_path / "local.zarr")
     assert in_docker.rr.dims == ("ensemble_member", "time", "y", "x")

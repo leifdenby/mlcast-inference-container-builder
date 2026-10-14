@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -19,9 +20,8 @@ import mlcast_icb.serve as serve_module
 from mlcast_icb import __version__
 from mlcast_icb.bundle import create_bundle, mlcast_version
 from mlcast_icb.errors import ConfigError
+from mlcast_icb.options import serve_parser
 from mlcast_icb.serve import (
-    KNOWN_VARIABLES,
-    SERVE_VARIABLES,
     LoadedModel,
     ServeConfig,
     create_app,
@@ -608,43 +608,57 @@ def test_openapi_documents_the_predict_body(client: TestClient) -> None:
 
 
 def test_defaults() -> None:
-    config = ServeConfig.from_env({})
+    config = ServeConfig.from_command_line([], {})
     assert config == ServeConfig()
     assert (config.host, config.port, config.max_upload_mb, config.max_queue) == ("0.0.0.0", 8000, 100, 2)
     assert config.request_timeout is None
     assert config.model_dir == "/model"
 
 
-def test_values_are_parsed() -> None:
-    env = {
-        "MODEL_DIR": "/m",
-        "DEVICE": "CPU",
-        "HOST": "127.0.0.1",
-        "PORT": "9000",
-        "MAX_UPLOAD_MB": "5",
-        "MAX_QUEUE": "0",
-        "REQUEST_TIMEOUT": "2.5",
-        "MAX_FORECAST_STEPS": "24",
-        "MAX_ENSEMBLE_SIZE": "50",
-        "LOG_LEVEL": "debug",
-    }
-    config = ServeConfig.from_env(env)
-    assert config == ServeConfig("/m", "cpu", "127.0.0.1", 9000, 5, 0, 2.5, 24, 50, "DEBUG")
-    assert list(describe_config(config)) == list(SERVE_VARIABLES)
+SERVE_VALUES = {
+    "model_dir": "/m",
+    "device": "CPU",
+    "host": "127.0.0.1",
+    "port": "9000",
+    "max_upload_mb": "5",
+    "max_queue": "0",
+    "request_timeout": "2.5",
+    "max_forecast_steps": "24",
+    "max_ensemble_size": "50",
+    "log_level": "debug",
+}
+PARSED_VALUES = ServeConfig("/m", "cpu", "127.0.0.1", 9000, 5, 0, 2.5, 24, 50, "DEBUG")
+
+
+def test_values_are_parsed_from_the_environment() -> None:
+    config = ServeConfig.from_command_line(
+        [], {f"MLCAST_{dest.upper()}": value for dest, value in SERVE_VALUES.items()}
+    )
+    assert config == PARSED_VALUES
+    dests = [action.dest for action in serve_parser()._actions if action.dest != "help"]
+    assert list(describe_config(config)) == dests
+
+
+def test_values_are_parsed_from_the_command_line() -> None:
+    argv = [arg for dest, value in SERVE_VALUES.items() for arg in (f"--{dest.replace('_', '-')}", value)]
+    assert ServeConfig.from_command_line(argv, {"MLCAST_PORT": "1234"}) == PARSED_VALUES
 
 
 def test_every_problem_is_collected() -> None:
-    env = {"PORT": "70000", "MAX_QUEUE": "-1", "REQUEST_TIMEOUT": "soon", "DEVICE": "tpu", "MAX_UPLOAD_MB": "0"}
+    env = {"MLCAST_PORT": "70000", "MLCAST_MAX_QUEUE": "-1", "MLCAST_REQUEST_TIMEOUT": "soon", "MLCAST_DEVICE": "tpu"}
     with pytest.raises(ConfigError) as info:
-        ServeConfig.from_env(env)
+        ServeConfig.from_command_line(["--max-upload-mb", "0"], env)
     message = str(info.value)
     assert "5 problems" in message
-    for fragment in ("PORT", "MAX_QUEUE", "REQUEST_TIMEOUT", "DEVICE", "MAX_UPLOAD_MB"):
+    assert "MLCAST_PORT must be at most 65535" in message
+    for fragment in ("MLCAST_MAX_QUEUE", "MLCAST_REQUEST_TIMEOUT", "MLCAST_DEVICE", "--max-upload-mb"):
         assert fragment in message
 
 
-def test_every_serve_variable_is_known() -> None:
-    assert set(SERVE_VARIABLES) == KNOWN_VARIABLES
+def test_a_run_variable_is_ignored_and_an_unknown_one_is_not() -> None:
+    assert ServeConfig.from_command_line([], {"MLCAST_INPUT_ZARR": "s3://b/in.zarr"}) == ServeConfig()
+    with pytest.raises(SystemExit):
+        ServeConfig.from_command_line([], {"MLCAST_MAX_QUEU": "3"})
 
 
 @pytest.fixture
@@ -666,33 +680,42 @@ def no_server(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
 
 
 def test_config_error_exits_2_before_binding(no_server: list[Any], capsys: pytest.CaptureFixture[str]) -> None:
-    assert main({"PORT": "x", "MAX_QUEUE": "-1", "MAX_QUEU": "3"}) == 2
+    assert main([], {"MLCAST_PORT": "x", "MLCAST_MAX_QUEUE": "-1"}) == 2
     assert no_server == []
     err = capsys.readouterr().err
     assert f"Starting mlcast-inference-container-builder {__version__} (serve)" in err
-    assert "Did you mean MAX_QUEUE?" in err
-    assert "PORT must be an integer" in err and "MAX_QUEUE must be at least 0" in err
+    assert "MLCAST_PORT must be an integer" in err and "MLCAST_MAX_QUEUE must be at least 0" in err
+
+
+def test_unknown_variable_exits_2_before_binding(no_server: list[Any], capsys: pytest.CaptureFixture[str]) -> None:
+    assert main([], {"MLCAST_MAX_QUEU": "3"}) == 2
+    assert no_server == []
+    assert "MLCAST_MAX_QUEU (did you mean MLCAST_MAX_QUEUE?)" in capsys.readouterr().err
 
 
 def test_missing_bundle_exits_6_before_binding(no_server: list[Any], tmp_path: Path) -> None:
-    assert main({"MODEL_DIR": str(tmp_path / "nothing"), "DEVICE": "cpu"}) == 6
+    assert main(["--model-dir", str(tmp_path / "nothing")], {"MLCAST_DEVICE": "cpu"}) == 6
     assert no_server == []
 
 
 def test_cuda_without_a_gpu_exits_4(no_server: list[Any], bundle_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("torch.cuda.is_available", lambda: False)
-    assert main({"MODEL_DIR": str(bundle_dir), "DEVICE": "cuda"}) == 4
+    assert main([], {"MLCAST_MODEL_DIR": str(bundle_dir), "MLCAST_DEVICE": "cuda"}) == 4
     assert no_server == []
 
 
 def test_main_loads_the_model_then_serves(
     no_server: list[Any], bundle_dir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main({"MODEL_DIR": str(bundle_dir), "DEVICE": "cpu", "HOST": "127.0.0.1", "PORT": "8123"}) == 0
+    env = {"MLCAST_MODEL_DIR": str(bundle_dir), "MLCAST_DEVICE": "cpu", "MLCAST_HOST": "127.0.0.1"}
+    assert main(["--port", "8123"], env | {"MLCAST_PORT": "9999", "MLCAST_SEED": "1"}) == 0
     (uvicorn_config,) = no_server
     assert (uvicorn_config.host, uvicorn_config.port) == ("127.0.0.1", 8123)
     err = capsys.readouterr().err
     assert "Effective configuration" in err
+    assert re.search(r"MLCAST_PORT += 8123 \(cli\)$", err, re.MULTILINE)
+    assert re.search(r"MLCAST_HOST += 127\.0\.0\.1 \(env\)$", err, re.MULTILINE)
+    assert re.search(r"MLCAST_MAX_QUEUE += 2 \(default\)$", err, re.MULTILINE)
     assert "irene-tiny" in err
     assert "req=-" in err
 

@@ -83,7 +83,7 @@ def flaky_input(flaky: Callable[..., None]) -> str:
 def no_aws(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Switch off every AWS credential source, so nothing here can find real ones."""
     for key in list(os.environ):
-        if key.startswith(("AWS_", "SRC_", "DST_")):
+        if key.startswith(("AWS_", "MLCAST_")):
             monkeypatch.delenv(key)
     monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "no-aws-config"))
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "no-aws-credentials"))

@@ -1,4 +1,4 @@
-"""Resolving the ``DEVICE`` setting to a torch device, failing hard when CUDA was required."""
+"""Resolving the ``--device`` setting (``MLCAST_DEVICE``) to a torch device, failing hard when CUDA was required."""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ from loguru import logger
 
 from mlcast_icb.errors import DeviceError
 
-#: Accepted values of the ``DEVICE`` setting.
+#: Accepted values of the ``--device`` setting.
 DEVICES = ("auto", "cuda", "cpu")
 
 
 def select_device(requested: str) -> torch.device:
-    """Resolve a ``DEVICE`` setting to a concrete torch device.
+    """Resolve a ``--device`` setting to a concrete torch device.
 
     Parameters
     ----------
@@ -36,9 +36,10 @@ def select_device(requested: str) -> torch.device:
     if requested == "cuda":
         if not available:
             raise DeviceError(
-                "DEVICE=cuda but no CUDA device is visible to this process. Check that the container was "
+                "The device is cuda but no CUDA device is visible to this process. Check that the container was "
                 "started with GPU access (e.g. `docker run --gpus all`) and that the NVIDIA driver is present, "
-                f"or set DEVICE=cpu. torch {torch.__version__}, built for CUDA {torch.version.cuda}."
+                f"or set MLCAST_DEVICE=cpu (--device cpu). torch {torch.__version__}, built for CUDA "
+                f"{torch.version.cuda}."
             )
         device = torch.device("cuda")
     elif requested == "cpu":
@@ -46,7 +47,7 @@ def select_device(requested: str) -> torch.device:
     else:
         device = torch.device("cuda" if available else "cpu")
         if not available:
-            logger.warning("DEVICE=auto and no CUDA device is visible; running on CPU")
+            logger.warning("The device is auto and no CUDA device is visible; running on CPU")
 
     if device.type == "cuda":
         props = torch.cuda.get_device_properties(device)

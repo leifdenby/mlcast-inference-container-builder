@@ -1,10 +1,11 @@
-"""Per-side storage options built from the environment, and their masking in the log."""
+"""Per-side storage options (``--input-*`` / ``--output-*``), and their masking in the log."""
 
 from __future__ import annotations
 
 import copy
 import json
 from collections.abc import Callable, Iterator
+from typing import Any
 
 import fsspec
 import fsspec.implementations.memory
@@ -13,11 +14,24 @@ import xarray as xr
 from loguru import logger
 
 from mlcast_icb.errors import ConfigError
-from mlcast_icb.io.storage import redact, storage_options, storage_variables
+from mlcast_icb.io.storage import (
+    AMBIENT_CREDENTIAL_VARS,
+    StorageSettings,
+    log_storage_options,
+    redact,
+    redact_json,
+    side_variable,
+    storage_options,
+)
 from mlcast_icb.io.zarr_io import write_zarr
 
 S3 = "s3://bucket/in.zarr"
 OTHER_S3 = "s3://other-bucket/out.zarr"
+
+
+def opts(uri: str, side: str = "input", env: dict[str, str] | None = None, **settings: Any) -> dict[str, Any]:
+    """The storage options for ``uri`` with the side's ``settings``, in the environment ``env`` (none by default)."""
+    return storage_options(side, uri, StorageSettings(**settings), env or {})
 
 
 @pytest.fixture
@@ -30,81 +44,70 @@ def log_lines() -> Iterator[list[str]]:
 
 
 def test_local_paths_get_no_options() -> None:
-    assert storage_options({}, "/data/in.zarr", "SRC") == {}
+    assert opts("/data/in.zarr") == {}
 
 
 def test_profile_applies_to_s3() -> None:
-    options = storage_options({"SRC_AWS_PROFILE": "reader"}, S3, "SRC")
-    assert options["profile"] == "reader"
+    assert opts(S3, aws_profile="reader")["profile"] == "reader"
 
 
-def test_source_and_destination_are_independent() -> None:
-    env = {"SRC_AWS_PROFILE": "era5-reader", "DST_AWS_PROFILE": "dmi-minio"}
-    assert storage_options(env, S3, "SRC")["profile"] == "era5-reader"
-    assert storage_options(env, OTHER_S3, "DST")["profile"] == "dmi-minio"
+def test_input_and_output_are_independent() -> None:
+    assert opts(S3, "input", aws_profile="era5-reader")["profile"] == "era5-reader"
+    assert opts(OTHER_S3, "output", aws_profile="dmi-minio")["profile"] == "dmi-minio"
 
 
-def test_unprefixed_profile_applies_to_both_sides() -> None:
-    env = {"AWS_PROFILE": "shared"}
-    assert storage_options(env, S3, "SRC")["profile"] == "shared"
-    assert storage_options(env, S3, "DST")["profile"] == "shared"
-
-
-def test_side_specific_wins_over_unprefixed() -> None:
-    env = {"AWS_PROFILE": "shared", "DST_AWS_PROFILE": "writer"}
-    assert storage_options(env, S3, "SRC")["profile"] == "shared"
-    assert storage_options(env, S3, "DST")["profile"] == "writer"
+def test_the_standard_aws_profile_is_left_to_botocore() -> None:
+    """AWS_PROFILE applies to both sides through botocore itself, with its usual precedence."""
+    options = opts(S3, env={"AWS_PROFILE": "shared"})
+    assert "profile" not in options
+    assert options["anon"] is False  # but it counts as credentials
 
 
 def test_no_endpoint_option_when_the_profile_carries_it() -> None:
     """The AWS config is the normal home for endpoint_url, so we pass nothing."""
-    options = storage_options({"SRC_AWS_PROFILE": "dmi-minio"}, S3, "SRC")
+    assert "client_kwargs" not in opts(S3, aws_profile="dmi-minio")
+
+
+def test_endpoint_option_is_available() -> None:
+    options = opts(OTHER_S3, "output", s3_endpoint_url="https://s3.dmi.dk")
+    assert options["client_kwargs"] == {"endpoint_url": "https://s3.dmi.dk"}
+
+
+def test_the_standard_endpoint_variables_are_left_to_botocore() -> None:
+    options = opts(S3, env={"AWS_ENDPOINT_URL": "https://s3.dmi.dk", "AWS_ENDPOINT_URL_S3": "https://s3.dmi.dk"})
     assert "client_kwargs" not in options
 
 
-def test_endpoint_override_is_available() -> None:
-    options = storage_options({"DST_S3_ENDPOINT_URL": "https://s3.dmi.dk"}, OTHER_S3, "DST")
-    assert options["client_kwargs"] == {"endpoint_url": "https://s3.dmi.dk"}
+def test_the_old_unprefixed_s3_endpoint_url_is_not_read() -> None:
+    assert "client_kwargs" not in opts(S3, env={"S3_ENDPOINT_URL": "https://s3.dmi.dk"})
 
 
-def test_aws_endpoint_url_is_accepted_as_a_fallback() -> None:
-    options = storage_options({"AWS_ENDPOINT_URL": "https://s3.dmi.dk"}, S3, "SRC")
-    assert options["client_kwargs"] == {"endpoint_url": "https://s3.dmi.dk"}
-
-
-def test_storage_variables_cover_both_sides_and_the_shared_names() -> None:
-    names = storage_variables()
-    assert {"SRC_AWS_PROFILE", "DST_STORAGE_OPTIONS", "AWS_PROFILE", "AWS_ROLE_ARN"} <= names
-    assert not any(name.startswith("SRC_") for name in storage_variables(("DST",)))
+def test_side_variable_names() -> None:
+    assert side_variable("input", "AWS_PROFILE") == "MLCAST_INPUT_AWS_PROFILE"
+    assert side_variable("output", "S3_ENDPOINT_URL") == "MLCAST_OUTPUT_S3_ENDPOINT_URL"
 
 
 # --- anonymous by default ------------------------------------------------------------
 
 
 def test_anon_by_default_when_nothing_is_configured() -> None:
-    assert storage_options({}, S3, "SRC")["anon"] is True
+    assert opts(S3)["anon"] is True
 
 
 def test_a_profile_turns_signing_on() -> None:
-    assert storage_options({"SRC_AWS_PROFILE": "reader"}, S3, "SRC")["anon"] is False
+    assert opts(S3, aws_profile="reader")["anon"] is False
 
 
 def test_ambient_aws_keys_turn_signing_on() -> None:
-    env = {"AWS_ACCESS_KEY_ID": "AKIA...", "AWS_SECRET_ACCESS_KEY": "..."}
-    assert storage_options(env, S3, "SRC")["anon"] is False
+    assert opts(S3, env={"AWS_ACCESS_KEY_ID": "AKIA...", "AWS_SECRET_ACCESS_KEY": "..."})["anon"] is False
 
 
-def test_side_specific_keys_turn_signing_on_and_are_passed() -> None:
-    env = {"SRC_AWS_ACCESS_KEY_ID": "AKIA...", "SRC_AWS_SECRET_ACCESS_KEY": "shh"}
-    options = storage_options(env, S3, "SRC")
-    assert options["anon"] is False
-    assert options["key"] == "AKIA..."
-    assert options["secret"] == "shh"
-
-
-def test_side_specific_keys_do_not_leak_to_the_other_side() -> None:
-    env = {"SRC_AWS_ACCESS_KEY_ID": "AKIA...", "SRC_AWS_SECRET_ACCESS_KEY": "shh"}
-    assert "key" not in storage_options(env, OTHER_S3, "DST")
+def test_the_environment_defaults_to_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in AMBIENT_CREDENTIAL_VARS:
+        monkeypatch.delenv(name, raising=False)
+    assert storage_options("input", S3)["anon"] is True
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA...")
+    assert storage_options("input", S3)["anon"] is False
 
 
 @pytest.mark.parametrize(
@@ -113,89 +116,77 @@ def test_side_specific_keys_do_not_leak_to_the_other_side() -> None:
 )
 def test_ambient_role_credentials_turn_signing_on(var: str) -> None:
     """IAM roles on ECS/EKS/EC2 are credentials, even with no keys in the environment."""
-    assert storage_options({var: "something"}, S3, "SRC")["anon"] is False
+    assert opts(S3, env={var: "something"})["anon"] is False
 
 
 def test_credentials_in_the_json_escape_hatch_turn_signing_on() -> None:
-    env = {"SRC_STORAGE_OPTIONS": '{"key": "AKIA...", "secret": "shh"}'}
-    assert storage_options(env, S3, "SRC")["anon"] is False
+    assert opts(S3, storage_options='{"key": "AKIA...", "secret": "shh"}')["anon"] is False
 
 
 def test_s3fs_credential_aliases_turn_signing_on() -> None:
-    env = {"SRC_STORAGE_OPTIONS": '{"username": "AKIA...", "password": "shh"}'}
-    assert storage_options(env, S3, "SRC")["anon"] is False
+    assert opts(S3, storage_options='{"username": "AKIA...", "password": "shh"}')["anon"] is False
 
 
 @pytest.mark.parametrize("name", ["aws_access_key_id", "aws_secret_access_key", "aws_session_token"])
 def test_credentials_inside_client_kwargs_turn_signing_on(name: str) -> None:
-    env = {"SRC_STORAGE_OPTIONS": json.dumps({"client_kwargs": {name: "shh"}})}
-    assert storage_options(env, S3, "SRC")["anon"] is False
+    assert opts(S3, storage_options=json.dumps({"client_kwargs": {name: "shh"}}))["anon"] is False
 
 
 def test_client_kwargs_without_credentials_stay_anonymous() -> None:
-    env = {"SRC_STORAGE_OPTIONS": '{"client_kwargs": {"region_name": "eu-north-1"}}'}
-    assert storage_options(env, S3, "SRC")["anon"] is True
+    assert opts(S3, storage_options='{"client_kwargs": {"region_name": "eu-north-1"}}')["anon"] is True
 
 
 def test_explicit_anon_wins_over_credentials() -> None:
-    env = {"SRC_AWS_PROFILE": "reader", "SRC_S3_ANON": "true"}
-    assert storage_options(env, S3, "SRC")["anon"] is True
+    assert opts(S3, aws_profile="reader", s3_anon=True)["anon"] is True
 
 
 def test_explicit_anon_false_wins_over_the_default() -> None:
-    assert storage_options({"SRC_S3_ANON": "false"}, S3, "SRC")["anon"] is False
+    assert opts(S3, s3_anon=False)["anon"] is False
 
 
 def test_json_can_override_anon() -> None:
-    env = {"SRC_STORAGE_OPTIONS": '{"anon": false}'}
-    assert storage_options(env, S3, "SRC")["anon"] is False
-
-
-@pytest.mark.parametrize(("value", "expected"), [("true", True), ("1", True), ("false", False), ("no", False)])
-def test_anon_spellings(value: str, expected: bool) -> None:
-    assert storage_options({"SRC_S3_ANON": value}, S3, "SRC")["anon"] is expected
-
-
-def test_bad_anon_is_rejected() -> None:
-    with pytest.raises(ConfigError, match="must be a boolean"):
-        storage_options({"SRC_S3_ANON": "maybe"}, S3, "SRC")
+    assert opts(S3, s3_anon=True, storage_options='{"anon": false}')["anon"] is False
 
 
 def test_anon_is_not_set_for_non_s3_schemes() -> None:
-    assert "anon" not in storage_options({}, "gs://bucket/in.zarr", "SRC")
-    assert storage_options({}, "/data/in.zarr", "SRC") == {}
+    assert "anon" not in opts("gs://bucket/in.zarr")
+    assert opts("/data/in.zarr") == {}
 
 
 # --- the JSON escape hatch -----------------------------------------------------------
 
 
-def test_s3_options_are_ignored_for_other_schemes() -> None:
-    env = {"SRC_AWS_PROFILE": "reader"}
-    assert storage_options(env, "gs://bucket/in.zarr", "SRC") == {}
-    assert storage_options(env, "/data/in.zarr", "SRC") == {}
+def test_s3_options_are_ignored_for_other_schemes(log_lines: list[str]) -> None:
+    assert opts("gs://bucket/in.zarr", aws_profile="reader") == {}
+    assert opts("/data/in.zarr", s3_anon=True) == {}
+    assert any("MLCAST_INPUT_AWS_PROFILE" in line and "not an S3 URI" in line for line in log_lines)
 
 
 def test_json_reaches_any_option() -> None:
-    env = {"SRC_STORAGE_OPTIONS": '{"requester_pays": true, "config_kwargs": {"max_pool": 4}}'}
-    options = storage_options(env, S3, "SRC")
+    options = opts(S3, storage_options='{"requester_pays": true, "config_kwargs": {"max_pool": 4}}')
     assert options["requester_pays"] is True
     assert options["config_kwargs"] == {"max_pool": 4}
 
 
 def test_json_applies_to_non_s3_schemes_too() -> None:
-    env = {"DST_STORAGE_OPTIONS": '{"project": "my-gcp-project"}'}
-    assert storage_options(env, "gs://bucket/out.zarr", "DST") == {"project": "my-gcp-project"}
+    options = opts("gs://bucket/out.zarr", "output", storage_options='{"project": "my-gcp-project"}')
+    assert options == {"project": "my-gcp-project"}
 
 
-def test_json_overrides_the_dedicated_variables() -> None:
-    env = {"SRC_AWS_PROFILE": "reader", "SRC_STORAGE_OPTIONS": '{"profile": "override"}'}
-    assert storage_options(env, S3, "SRC")["profile"] == "override"
+def test_json_overrides_the_dedicated_options() -> None:
+    assert opts(S3, aws_profile="reader", storage_options='{"profile": "override"}')["profile"] == "override"
 
 
 @pytest.mark.parametrize(("value", "message"), [("not json", "must be valid JSON"), ('["a"]', "must be a JSON object")])
-def test_malformed_json_is_rejected(value: str, message: str) -> None:
-    with pytest.raises(ConfigError, match=message):
-        storage_options({"SRC_STORAGE_OPTIONS": value}, S3, "SRC")
+def test_malformed_json_is_rejected_naming_the_variable(value: str, message: str) -> None:
+    with pytest.raises(ConfigError, match=f"MLCAST_OUTPUT_STORAGE_OPTIONS {message}"):
+        opts(S3, "output", storage_options=value)
+
+
+def test_redact_json_masks_secrets_and_malformed_values() -> None:
+    assert json.loads(redact_json('{"key": "AKIA", "profile": "p"}')) == {"key": "***", "profile": "p"}
+    assert redact_json("not json with a secret") == "*** (not a JSON object)"
+    assert redact_json(None) is None
 
 
 # --- redaction of the log line -------------------------------------------------------
@@ -357,19 +348,22 @@ def test_redaction_does_not_modify_the_options_passed_to_fsspec() -> None:
 
 def test_storage_options_returns_the_real_secrets() -> None:
     """Only the log is masked; s3fs still gets the credentials it was given."""
-    env = {"SRC_STORAGE_OPTIONS": '{"client_kwargs": {"aws_secret_access_key": "nested-shh"}}'}
-    options = storage_options(env, S3, "SRC")
+    options = opts(S3, storage_options='{"client_kwargs": {"aws_secret_access_key": "nested-shh"}}')
     assert options["client_kwargs"]["aws_secret_access_key"] == "nested-shh"
 
 
 def test_credentials_are_redacted_from_the_log(log_lines: list[str]) -> None:
-    env = {"SRC_STORAGE_OPTIONS": '{"key": "AKIAsecret", "secret": "shhh"}'}
-    storage_options(env, S3, "SRC")
+    log_storage_options("input", opts(S3, storage_options='{"key": "AKIAsecret", "secret": "shhh"}'))
 
     combined = "".join(log_lines)
     assert "AKIAsecret" not in combined
     assert "shhh" not in combined
     assert "***" in combined
+
+
+def test_anonymous_access_is_logged_with_what_to_set(log_lines: list[str]) -> None:
+    log_storage_options("output", opts(OTHER_S3, "output"))
+    assert any("output store is using anonymous access; set MLCAST_OUTPUT_AWS_PROFILE" in line for line in log_lines)
 
 
 class _OptionsMemoryFileSystem(fsspec.implementations.memory.MemoryFileSystem):
@@ -402,14 +396,15 @@ def test_nested_destination_secret_stays_out_of_the_log(
         "session_kwargs": [{"private_key": "pem-shh", "client_email": "sa@p.iam"}],
     }
     uri = "optsmem://redacted-log.zarr"
-    env = {"DST_STORAGE_OPTIONS": json.dumps(storage)}
 
-    # When the options are built and used for a real write
-    write_zarr(make_dataset(), uri, storage_options(env, uri, "DST"), zarr_format=3)
+    # When the options are built, logged and used for a real write
+    options = opts(uri, "output", storage_options=json.dumps(storage))
+    log_storage_options("output", options)
+    write_zarr(make_dataset(), uri, options, zarr_format=3)
 
     # Then the secrets never reach the log, but everything identifying does
     combined = "\n".join(log_lines)
-    line = next(line for line in log_lines if "DST storage options" in line)
+    line = next(line for line in log_lines if "output storage options" in line)
     for secret in ("nested-shh", "proxy-shh", "pem-shh"):
         assert secret not in combined
     assert "eu-north-1" in line
@@ -421,34 +416,33 @@ def test_nested_destination_secret_stays_out_of_the_log(
 
 
 @pytest.mark.parametrize(
-    "env",
+    "settings",
     [
         {},
-        {"SRC_AWS_PROFILE": "some-profile"},
-        {"SRC_S3_ENDPOINT_URL": "https://s3.dmi.dk"},
-        {"SRC_AWS_ACCESS_KEY_ID": "AKIA...", "SRC_AWS_SECRET_ACCESS_KEY": "shh"},
-        {"SRC_S3_ANON": "true"},
-        {"SRC_STORAGE_OPTIONS": '{"requester_pays": true}'},
+        {"aws_profile": "some-profile"},
+        {"s3_endpoint_url": "https://s3.dmi.dk"},
+        {"s3_anon": True},
+        {"s3_anon": False},
+        {"storage_options": '{"requester_pays": true}'},
     ],
 )
-def test_options_construct_a_real_s3_filesystem(env: dict[str, str]) -> None:
+def test_options_construct_a_real_s3_filesystem(settings: dict[str, Any]) -> None:
     """Guards against inventing an option name s3fs would silently ignore or reject.
 
     No network: constructing the filesystem only resolves configuration.
     """
     s3fs = pytest.importorskip("s3fs")
-    fs = s3fs.S3FileSystem(**storage_options(env, S3, "SRC"), skip_instance_cache=True)
+    fs = s3fs.S3FileSystem(**opts(S3, **settings), skip_instance_cache=True)
     assert "s3" in fs.protocol
 
 
-def test_endpoint_override_reaches_the_filesystem() -> None:
+def test_endpoint_option_reaches_the_filesystem() -> None:
     s3fs = pytest.importorskip("s3fs")
-    options = storage_options({"SRC_S3_ENDPOINT_URL": "https://s3.dmi.dk"}, S3, "SRC")
-    fs = s3fs.S3FileSystem(**options, skip_instance_cache=True)
+    fs = s3fs.S3FileSystem(**opts(S3, s3_endpoint_url="https://s3.dmi.dk"), skip_instance_cache=True)
     assert fs.client_kwargs["endpoint_url"] == "https://s3.dmi.dk"
 
 
 def test_anon_default_reaches_the_filesystem() -> None:
     s3fs = pytest.importorskip("s3fs")
-    fs = s3fs.S3FileSystem(**storage_options({}, S3, "SRC"), skip_instance_cache=True)
+    fs = s3fs.S3FileSystem(**opts(S3), skip_instance_cache=True)
     assert fs.anon is True

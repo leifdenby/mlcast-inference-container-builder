@@ -16,9 +16,11 @@ from mlcast.config.orchestrator import _log_experiment_config_yaml_file
 from mlcast.models.convgru import ConvGruModel
 
 #: Set to 1 to run the slow tests on the real IRENE checkpoint (like ``--run-irene``).
-IRENE_ENV = "MLCAST_ICB_IRENE"
+#: Test switches never start with ``MLCAST_``: the application rejects an ``MLCAST_*``
+#: variable that is not one of its options, and the tests run it in this environment.
+IRENE_ENV = "ICB_TEST_IRENE"
 #: Set to 1 to run the tests that build and run images with Docker (like ``--run-docker``).
-DOCKER_ENV = "MLCAST_ICB_DOCKER"
+DOCKER_ENV = "ICB_TEST_DOCKER"
 
 TINY_INPUT_STEPS = 3
 TINY_FORECAST_STEPS = 2

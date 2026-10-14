@@ -130,7 +130,7 @@ lint.ignore = [ "F722" ]
 [tool.pytest.ini_options]
 testpaths = [ "tests" ]
 markers = [
-  "irene: slow test on the real IRENE checkpoint (770 MB); run with --run-irene or MLCAST_ICB_IRENE=1",
+  "irene: slow test on the real IRENE checkpoint (770 MB); run with --run-irene or ICB_TEST_IRENE=1",
 ]
 
 [tool.uv]

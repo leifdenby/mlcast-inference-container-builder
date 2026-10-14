@@ -2,7 +2,8 @@
 
 ``test_storage.py`` checks the options we build; these check that s3fs actually reads
 and writes with them. Each server is a separate ``moto_server`` process, so two of them
-are genuinely two hosts with separate state — which is what the SRC_/DST_ split is for.
+are genuinely two hosts with separate state — which is what the per-side
+(``--input-*`` / ``--output-*``) storage options are for.
 Nothing here touches the network beyond localhost.
 """
 
@@ -22,12 +23,12 @@ import xarray as xr
 from io_testdata import build_dataset
 
 from mlcast_icb.errors import InputError
-from mlcast_icb.io.storage import storage_options
+from mlcast_icb.io.storage import StorageSettings, storage_options
 from mlcast_icb.io.zarr_io import load_zarr, open_zarr, write_zarr
 
 boto3 = pytest.importorskip("boto3")
 pytest.importorskip("moto.server")
-pytest.importorskip("s3fs")
+s3fs = pytest.importorskip("s3fs")
 
 KEY = "testing-key"
 SECRET = "testing-secret"
@@ -47,7 +48,6 @@ _AMBIENT_AWS_VARS = (
     "AWS_ROLE_ARN",
     "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
     "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-    "S3_ENDPOINT_URL",
 )
 
 
@@ -103,6 +103,10 @@ def aws_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[[str, 
     """
     for name in _AMBIENT_AWS_VARS:
         monkeypatch.delenv(name, raising=False)
+    # s3fs reuses a filesystem for the same options, and with the standard AWS variables
+    # the options alone ({"anon": False}) no longer say which configuration it was made
+    # with; each test has its own, so start each with no cached filesystem.
+    s3fs.S3FileSystem.clear_instance_cache()
     config = tmp_path / "aws_config"
     credentials = tmp_path / "aws_credentials"
     config.write_text("")
@@ -121,7 +125,8 @@ def aws_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[[str, 
 
 
 def _client(endpoint: str):
-    return boto3.client(
+    # A fresh session: boto3's default one keeps the AWS configuration of the test that made it.
+    return boto3.session.Session().client(
         "s3", endpoint_url=endpoint, region_name=REGION, aws_access_key_id=KEY, aws_secret_access_key=SECRET
     )
 
@@ -156,36 +161,41 @@ def _put_input(endpoint: str, zarr_format: int = 3, public: bool = False) -> str
     return uri
 
 
-def _copy(env: dict[str, str], source: str, target: str) -> None:
-    """Read the input and write it to the output, as a run would, with options from env."""
-    src_options = storage_options(env, source, "SRC")
-    dst_options = storage_options(env, target, "DST")
-    ds = load_zarr(open_zarr(source, src_options), source, src_options)
-    write_zarr(ds, target, dst_options, source_uri=source, source_storage_options=src_options)
+def _copy(
+    source: str, target: str, input: StorageSettings | None = None, output: StorageSettings | None = None
+) -> None:
+    """Read the input and write it to the output, as a run would, with each side's options."""
+    input_options = storage_options("input", source, input)
+    output_options = storage_options("output", target, output)
+    ds = load_zarr(open_zarr(source, input_options), source, input_options)
+    write_zarr(ds, target, output_options, source_uri=source, source_storage_options=input_options)
 
 
 def _open_output(endpoint: str, uri: str) -> xr.Dataset:
     return xr.open_zarr(uri, storage_options=_signed(endpoint))
 
 
-def test_profile_endpoint_from_aws_config(s3_hosts: list[str], aws_home: Callable[[str, str], None]) -> None:
-    """The documented primary mechanism: one profile carries host and credentials.
+def test_profile_endpoint_from_aws_config(
+    s3_hosts: list[str], aws_home: Callable[[str, str], None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The standard AWS configuration: AWS_PROFILE names a profile carrying host and credentials.
 
-    No endpoint variable is set at all, so if s3fs ignored the profile's
-    ``endpoint_url`` the requests would go to real AWS and fail.
+    No endpoint is set at all, so if s3fs ignored the profile's ``endpoint_url`` the
+    requests would go to real AWS and fail.
     """
     host = s3_hosts[0]
     aws_home("rig", host)
+    monkeypatch.setenv("AWS_PROFILE", "rig")
     source = _put_input(host)
     target = f"s3://{_bucket(host)}/out.zarr"
 
-    _copy({"AWS_PROFILE": "rig"}, source, target)
+    _copy(source, target)
 
     xr.testing.assert_identical(_open_output(host, target).load(), build_dataset())
 
 
 def test_two_hosts_with_separate_profiles(s3_hosts: list[str], aws_home: Callable[[str, str], None]) -> None:
-    """SRC_ and DST_ profiles route each side to its own host."""
+    """--input-aws-profile and --output-aws-profile route each side to its own host."""
     src_host, dst_host = s3_hosts
     aws_home("reader", src_host)
     aws_home("writer", dst_host)
@@ -193,7 +203,7 @@ def test_two_hosts_with_separate_profiles(s3_hosts: list[str], aws_home: Callabl
     target_bucket = _bucket(dst_host)
     target = f"s3://{target_bucket}/out.zarr"
 
-    _copy({"SRC_AWS_PROFILE": "reader", "DST_AWS_PROFILE": "writer"}, source, target)
+    _copy(source, target, StorageSettings(aws_profile="reader"), StorageSettings(aws_profile="writer"))
 
     assert _open_output(dst_host, target).sizes["time"] == 4
     # The output bucket exists only on the destination host, so a write that went to
@@ -202,23 +212,45 @@ def test_two_hosts_with_separate_profiles(s3_hosts: list[str], aws_home: Callabl
     assert target_bucket not in source_buckets
 
 
-@pytest.mark.usefixtures("aws_home")
-def test_endpoint_override_and_explicit_keys(s3_hosts: list[str]) -> None:
-    """The no-config-file fallback: endpoint and keys straight from the environment."""
+def test_a_side_profile_wins_over_the_standard_profile(
+    s3_hosts: list[str], aws_home: Callable[[str, str], None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AWS_PROFILE configures the input; --output-aws-profile takes the output elsewhere."""
     src_host, dst_host = s3_hosts
+    aws_home("reader", src_host)
+    aws_home("writer", dst_host)
+    monkeypatch.setenv("AWS_PROFILE", "reader")
     source = _put_input(src_host)
     target = f"s3://{_bucket(dst_host)}/out.zarr"
 
-    env = {
-        "SRC_S3_ENDPOINT_URL": src_host,
-        "SRC_AWS_ACCESS_KEY_ID": KEY,
-        "SRC_AWS_SECRET_ACCESS_KEY": SECRET,
-        "DST_S3_ENDPOINT_URL": dst_host,
-        "DST_AWS_ACCESS_KEY_ID": KEY,
-        "DST_AWS_SECRET_ACCESS_KEY": SECRET,
-    }
-    _copy(env, source, target)
+    _copy(source, target, output=StorageSettings(aws_profile="writer"))
     assert _open_output(dst_host, target).sizes["time"] == 4
+
+
+@pytest.mark.usefixtures("aws_home")
+def test_endpoint_options_and_standard_keys(s3_hosts: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    """The no-config-file case: each side's endpoint as an option, keys in the standard variables."""
+    src_host, dst_host = s3_hosts
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", KEY)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", SECRET)
+    source = _put_input(src_host)
+    target = f"s3://{_bucket(dst_host)}/out.zarr"
+
+    _copy(source, target, StorageSettings(s3_endpoint_url=src_host), StorageSettings(s3_endpoint_url=dst_host))
+    assert _open_output(dst_host, target).sizes["time"] == 4
+
+
+@pytest.mark.usefixtures("aws_home")
+def test_standard_endpoint_variable_applies_to_both_sides(s3_hosts: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    """AWS_ENDPOINT_URL reaches s3fs through botocore, with no option set."""
+    host = s3_hosts[0]
+    for name, value in (("AWS_ACCESS_KEY_ID", KEY), ("AWS_SECRET_ACCESS_KEY", SECRET), ("AWS_ENDPOINT_URL", host)):
+        monkeypatch.setenv(name, value)
+    source = _put_input(host)
+    target = f"s3://{_bucket(host)}/out.zarr"
+
+    _copy(source, target)
+    assert _open_output(host, target).sizes["time"] == 4
 
 
 def test_anonymous_source_with_signed_destination(s3_hosts: list[str], aws_home: Callable[[str, str], None]) -> None:
@@ -232,19 +264,22 @@ def test_anonymous_source_with_signed_destination(s3_hosts: list[str], aws_home:
     source = _put_input(src_host, public=True)
     target = f"s3://{_bucket(dst_host)}/out.zarr"
 
-    _copy({"SRC_S3_ENDPOINT_URL": src_host, "DST_AWS_PROFILE": "writer"}, source, target)
+    _copy(source, target, StorageSettings(s3_endpoint_url=src_host), StorageSettings(aws_profile="writer"))
     assert _open_output(dst_host, target).sizes["time"] == 4
 
 
-def test_output_matches_input_zarr_format_over_s3(s3_hosts: list[str], aws_home: Callable[[str, str], None]) -> None:
+def test_output_matches_input_zarr_format_over_s3(
+    s3_hosts: list[str], aws_home: Callable[[str, str], None], monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Format detection has to work through s3fs, not just on a local path."""
     host = s3_hosts[0]
     aws_home("rig", host)
+    monkeypatch.setenv("AWS_PROFILE", "rig")
     source = _put_input(host, zarr_format=2)
     target_bucket = _bucket(host)
     target = f"s3://{target_bucket}/out.zarr"
 
-    _copy({"AWS_PROFILE": "rig"}, source, target)
+    _copy(source, target)
 
     keys = _keys(host, target_bucket)
     assert "out.zarr/.zgroup" in keys
@@ -256,4 +291,4 @@ def test_missing_input_store_on_s3_is_an_input_error(s3_hosts: list[str], aws_ho
     aws_home("rig", host)
     uri = f"s3://{_bucket(host)}/does-not-exist.zarr"
     with pytest.raises(InputError):
-        open_zarr(uri, storage_options({"AWS_PROFILE": "rig"}, uri, "SRC"))
+        open_zarr(uri, storage_options("input", uri, StorageSettings(aws_profile="rig")))

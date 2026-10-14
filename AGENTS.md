@@ -43,7 +43,16 @@ tests/
   or long `python -c` strings.
 - Ruff settings match mlcast's (line length 120). Run `ruff format` rather than
   hand-wrapping.
+- **Every function has a numpy-style docstring** (Parameters / Returns / Raises) **and full
+  type annotations**, private helpers, nested functions and route handlers included. This
+  applies to code copied from other repositories too: adapt it rather than keeping the
+  original's style.
 - Versioning is `hatch-vcs` from the git tag; never hardcode a version.
+- `run` and `serve` options are defined once, in `src/mlcast_icb/options.py`; each is also
+  an `MLCAST_*` variable through `src/mlcast_icb/envargs.py`, a stdlib-only copy of
+  `dmidk/mlwp-inference-container-anna`'s module (keep it generic and close to that
+  original). An unknown `MLCAST_*` variable is an error, so test switches and other
+  tooling variables use another prefix (`ICB_TEST_*`).
 - **mlcast is pinned to an exact commit** in `[tool.uv.sources]`. When bumping it, update
   the "Pinned mlcast version" table in README.md, re-run `uv lock`, and re-check the
   mlcast file/line references in `upstream/README.md`.

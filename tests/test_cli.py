@@ -67,7 +67,7 @@ def test_info_prints_the_manifest(bundle_dir: Path, capsys: pytest.CaptureFixtur
 def test_info_reads_model_dir_from_the_environment(
     bundle_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setenv("MODEL_DIR", str(bundle_dir))
+    monkeypatch.setenv("MLCAST_MODEL_DIR", str(bundle_dir))
     assert main(["info", "--verify"]) == 0
     captured = capsys.readouterr()
     assert json.loads(captured.out)["name"] == "tiny"
@@ -79,9 +79,36 @@ def test_info_on_a_missing_bundle_exits_6(tmp_path: Path) -> None:
 
 
 def test_serve_reads_the_environment(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    monkeypatch.setenv("PORT", "not-a-port")
+    monkeypatch.setenv("MLCAST_PORT", "not-a-port")
     assert main(["serve"]) == 2
-    assert "PORT must be an integer" in capsys.readouterr().err
+    assert "MLCAST_PORT must be an integer" in capsys.readouterr().err
+
+
+def test_serve_takes_options(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["serve", "--max-queue", "-1"]) == 2
+    assert "--max-queue must be at least 0" in capsys.readouterr().err
+
+
+def test_run_and_serve_help_list_the_variables(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["run", "--help"]) == 0
+    assert "[env: MLCAST_INPUT_AWS_PROFILE]" in " ".join(capsys.readouterr().out.split())
+    assert main(["serve", "--help"]) == 0
+    assert "[env: MLCAST_MAX_QUEUE]" in " ".join(capsys.readouterr().out.split())
+
+
+def test_unknown_option_of_run_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["run", "--max-queue", "3"]) == 2
+    assert "unrecognized arguments: --max-queue" in capsys.readouterr().err
+
+
+def test_developer_commands_ignore_mlcast_variables(
+    bundle_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """bundle, info, build and build-base are configured by their options only, and check no variable."""
+    monkeypatch.setenv("MLCAST_NOT_AN_OPTION", "1")
+    monkeypatch.setenv("MLCAST_CHECKPOINT", "/nowhere.ckpt")
+    assert main(["info", str(bundle_dir)]) == 0
+    assert json.loads(capsys.readouterr().out)["name"] == "tiny"
 
 
 def test_no_command_prints_help_and_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
@@ -99,10 +126,10 @@ def test_version(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 def test_run_reads_the_environment(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    for name in ("INPUT_ZARR", "OUTPUT_ZARR"):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("MLCAST_INPUT_ZARR", raising=False)
+    monkeypatch.setenv("MLCAST_OUTPUT_ZARR", "/out.zarr")
     assert main(["run"]) == 2
-    assert "INPUT_ZARR is required" in capsys.readouterr().err
+    assert "MLCAST_INPUT_ZARR (--input-zarr) is required" in capsys.readouterr().err
 
 
 def test_module_entry_point_returns_the_exit_code() -> None:
@@ -112,7 +139,20 @@ def test_module_entry_point_returns_the_exit_code() -> None:
         text=True,
         check=False,
         timeout=120,
-        env={**os.environ, "MAX_QUEUE": "-1"},
+        env={**os.environ, "MLCAST_MAX_QUEUE": "-1"},
     )
     assert result.returncode == 2
-    assert "MAX_QUEUE must be at least 0" in result.stderr
+    assert "MLCAST_MAX_QUEUE must be at least 0" in result.stderr
+
+
+def test_module_entry_point_rejects_a_misspelt_variable() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "mlcast_icb", "run"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+        env={**os.environ, "MLCAST_ENSEMBLE_SIZ": "2"},
+    )
+    assert result.returncode == 2
+    assert "MLCAST_ENSEMBLE_SIZ (did you mean MLCAST_ENSEMBLE_SIZE?)" in result.stderr

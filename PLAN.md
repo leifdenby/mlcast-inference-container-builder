@@ -165,8 +165,12 @@ includes its PR.
 
 ## Mode 1 — batch, zarr on S3 (`run`): low risk
 - Reuse `dummy-mlwp-model` patterns:
-  - storage: SRC_/DST_ env vars, anonymous by default, credential masking (`src/dummy_mlwp/storage.py`)
-  - env-var config with typo warnings (`envvars.py`) and exit codes (`errors.py`)
+  - storage: per-store options (`--input-*`/`--output-*`, i.e. `MLCAST_INPUT_*`/`MLCAST_OUTPUT_*`,
+    as in `mlwp-inference-container-anna`), anonymous by default, credential masking
+    (`src/dummy_mlwp/storage.py`)
+  - exit codes (`errors.py`); the configuration follows DMI's MLWP inference container
+    convention instead (every option also an `MLCAST_*` variable, unknown ones an error;
+    `envargs.py`, copied from `mlwp-inference-container-anna`)
   - CF coordinate detection (`grid.py`)
   - forecastReferenceTime/leadTime output (`outputs.py`, `timeaxis.py`)
 - Input follows the mlcast dataset spec. Variables are selected by CF `standard_name` via cf_xarray.

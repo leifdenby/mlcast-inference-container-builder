@@ -101,18 +101,19 @@ RUN uv export --quiet --frozen --no-emit-project --extra ${TORCH_EXTRA} --output
 # CUDA libraries instead of shipping its own would need -runtime back.
 #
 # A GPU image requires a GPU: started without one, `run` exits 4 instead of quietly
-# running on CPU. Pass DEVICE=cpu (or auto) to run it without a GPU.
+# running on CPU. Pass MLCAST_DEVICE=cpu (or auto), or --device cpu, to run it without
+# a GPU.
 # ---------------------------------------------------------------------------------
 FROM debian:trixie-slim AS os-cpu
 
 FROM nvidia/cuda:12.6.3-base-ubuntu24.04 AS os-gpu-cu126
-ENV DEVICE=cuda
+ENV MLCAST_DEVICE=cuda
 
 FROM nvidia/cuda:12.8.1-base-ubuntu24.04 AS os-gpu-cu128
-ENV DEVICE=cuda
+ENV MLCAST_DEVICE=cuda
 
 FROM nvidia/cuda:13.0.3-base-ubuntu24.04 AS os-gpu-cu130
-ENV DEVICE=cuda
+ENV MLCAST_DEVICE=cuda
 
 # ---------------------------------------------------------------------------------
 # Runtime stage: the locked dependencies, then the two wheels.
@@ -189,8 +190,9 @@ RUN if id -u ubuntu >/dev/null 2>&1; then userdel --remove ubuntu; fi \
 USER 1000
 WORKDIR /home/model
 
-# Where model images put the bundle; `run`, `serve` and `info` read it from here.
-ENV MODEL_DIR=/model
+# Where model images put the bundle; `run`, `serve` and `info` read it from here. Every
+# option of `run` and `serve` is also an MLCAST_* variable (--model-dir is this one).
+ENV MLCAST_MODEL_DIR=/model
 
 # `serve` listens here.
 EXPOSE 8000

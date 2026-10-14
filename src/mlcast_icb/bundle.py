@@ -1,6 +1,7 @@
 """The model bundle: the one directory an inference image adds on top of the runtime base.
 
-A bundle is two files, baked into the image at ``/model`` (``MODEL_DIR`` overrides it):
+A bundle is two files, baked into the image at ``/model`` (``--model-dir`` /
+``MLCAST_MODEL_DIR`` overrides it):
 
 ``model.ckpt``
     A stripped ``NowcastLightningModule`` checkpoint: the weights, the module's four
@@ -44,7 +45,7 @@ from mlcast_icb.errors import ConfigError, ModelError
 from mlcast_icb.upstream.checkpoint import load_model, save_inference_metadata
 from mlcast_icb.upstream.spec import InferenceSpec
 
-#: Where images carry the bundle, unless ``MODEL_DIR`` says otherwise.
+#: Where images carry the bundle, unless ``--model-dir`` (``MLCAST_MODEL_DIR``) says otherwise.
 DEFAULT_MODEL_DIR = "/model"
 
 #: File names inside a bundle.
@@ -221,7 +222,8 @@ def read_manifest(model_dir: str | Path) -> dict[str, Any]:
     if not model_dir.is_dir():
         raise ModelError(
             f"No model bundle at {model_dir}: the directory does not exist. Images carry the bundle at "
-            f"{DEFAULT_MODEL_DIR}; MODEL_DIR points elsewhere only for a bundle mounted at another path."
+            f"{DEFAULT_MODEL_DIR}; MLCAST_MODEL_DIR (--model-dir) points elsewhere only for a bundle mounted at "
+            "another path."
         )
     path = model_dir / MANIFEST_FILE
     try:

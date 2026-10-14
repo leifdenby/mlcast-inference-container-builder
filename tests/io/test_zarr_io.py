@@ -100,8 +100,10 @@ def test_accepted_values(value: str | None, expected: object) -> None:
 
 @pytest.mark.parametrize("value", ["1", "4", "v3", "zarr3", "3.0"])
 def test_other_values_are_rejected(value: str) -> None:
-    with pytest.raises(ConfigError, match="ZARR_FORMAT must be one of"):
+    with pytest.raises(ConfigError, match="--zarr-format must be one of"):
         parse_zarr_format(value)
+    with pytest.raises(ConfigError, match="MLCAST_ZARR_FORMAT must be one of"):
+        parse_zarr_format(value, "MLCAST_ZARR_FORMAT")
 
 
 @pytest.mark.parametrize(("requested", "detected"), [(2, 3), (3, 2)])

@@ -2,19 +2,30 @@
 
 The input and output stores are configured independently: a run can read from one S3
 account and write to another, or read from a public bucket and write to an on-premise
-S3-compatible host. Each side reads its own ``SRC_`` / ``DST_`` variables, falling back
-to the unprefixed spellings when both sides share one configuration.
+S3-compatible host. Each side has its own options, as in DMI's other inference
+containers: ``--input-aws-profile``, ``--input-s3-endpoint-url``, ``--input-s3-anon``
+and ``--input-storage-options`` (or ``MLCAST_INPUT_AWS_PROFILE`` and so on), and the same
+with ``output``. They are gathered in a :class:`StorageSettings` per side.
 
-Two deliberate choices:
+Three deliberate choices:
 
+* **Otherwise, the standard AWS configuration applies.** A side without its own profile
+  or endpoint is left to botocore, which reads ``AWS_PROFILE``, the ``AWS_*`` keys,
+  ``AWS_ENDPOINT_URL[_S3]``, IAM role credentials, and a profile's ``endpoint_url`` in
+  ``~/.aws/config``, for both sides alike. A side's own profile takes precedence over
+  ``AWS_ACCESS_KEY_ID`` and friends for that side (botocore drops the environment's keys
+  when a profile is given explicitly), and its own endpoint over ``AWS_ENDPOINT_URL``.
+  Credentials themselves never have options of their own: they come from the
+  environment, a profile, or a role.
 * **Endpoints belong in the AWS config.** A profile in ``~/.aws/config`` can carry its
   own ``endpoint_url``, which is how one run reaches two different S3-compatible hosts
-  with nothing but two profile names. ``<side>_S3_ENDPOINT_URL`` stays available as an
-  override for deployments that cannot mount a config file.
+  with nothing but two profile names. ``--<side>-s3-endpoint-url`` stays available for
+  deployments that cannot mount a config file.
 * **Access is anonymous unless credentials are actually given.** Reading a public
   bucket is a common case, and defaulting to signed requests turns that into a
-  confusing ``NoCredentialsError``. Naming a profile, supplying keys, or running under
-  an IAM role all count as credentials and switch signing back on.
+  confusing ``NoCredentialsError``. Naming a profile, having keys in the environment, or
+  running under an IAM role all count as credentials and switch signing back on;
+  ``--<side>-s3-anon`` decides explicitly.
 
 When a store cannot be reached anyway, :func:`storage_error` turns the failure into a
 :class:`~mlcast_icb.errors.StorageError` (exit 5) whose hint is built from these same
@@ -25,18 +36,21 @@ per-side options, and :func:`storage_exceptions` says which failures count.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
 from loguru import logger
 
+from mlcast_icb import ENV_PREFIX
 from mlcast_icb.errors import ConfigError, StorageError, format_problems
 
-#: The two independently configured stores, by variable prefix.
-SIDES = {"SRC": "input", "DST": "output"}
+#: The two independently configured stores; also the prefix of their options.
+SIDES = ("input", "output")
 
 #: Schemes for which the S3-specific options below are meaningful.
 S3_SCHEMES = ("s3", "s3a")
@@ -57,9 +71,10 @@ _BACKEND_ERRORS = (
     ("google.auth.exceptions", "GoogleAuthError"),
 )
 
-#: Environment variables that mean "this process already has AWS credentials", beyond a
-#: profile or explicit keys: the ambient role credentials used on ECS, EKS and EC2.
+#: Standard AWS variables that mean "this process already has AWS credentials": a
+#: profile, keys, or the ambient role credentials used on ECS, EKS and EC2.
 AMBIENT_CREDENTIAL_VARS = (
+    "AWS_PROFILE",
     "AWS_ACCESS_KEY_ID",
     "AWS_SESSION_TOKEN",
     "AWS_WEB_IDENTITY_TOKEN_FILE",
@@ -68,42 +83,8 @@ AMBIENT_CREDENTIAL_VARS = (
     "AWS_CONTAINER_CREDENTIALS_FULL_URI",
 )
 
-#: Storage variables read once per side, as ``<side>_<name>``.
-SIDE_VARIABLES = (
-    "AWS_PROFILE",
-    "S3_ENDPOINT_URL",
-    "AWS_ENDPOINT_URL",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "S3_ANON",
-    "STORAGE_OPTIONS",
-)
-
-#: Unprefixed storage variables that apply to both sides when the prefixed one is unset.
-SHARED_VARIABLES = ("AWS_PROFILE", "S3_ENDPOINT_URL", "AWS_ENDPOINT_URL", "S3_ANON")
-
-
-def storage_variables(sides: tuple[str, ...] = tuple(SIDES)) -> frozenset[str]:
-    """List every environment variable :func:`storage_options` may read.
-
-    Parameters
-    ----------
-    sides : tuple of str, optional
-        The sides in use, by prefix. Defaults to both ``SRC`` and ``DST``; a mode that
-        only ever writes could pass ``("DST",)``.
-
-    Returns
-    -------
-    frozenset of str
-        The prefixed variables of each side, the shared unprefixed ones, and the ambient
-        credential variables whose mere presence switches S3 requests to signed. Meant
-        to be added to the known names given to
-        :func:`~mlcast_icb.envvars.warn_unknown_env_vars`.
-    """
-    prefixed = {f"{side}_{name}" for side in sides for name in SIDE_VARIABLES}
-    return frozenset(prefixed | set(SHARED_VARIABLES) | set(AMBIENT_CREDENTIAL_VARS))
-
+#: Standard AWS variables that set the S3 endpoint, in botocore's order of precedence.
+AMBIENT_ENDPOINT_VARS = ("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
 
 #: fsspec option names that carry a credential.
 _CREDENTIAL_OPTIONS = ("profile", "key", "secret", "token", "username", "password")
@@ -132,17 +113,64 @@ _SECRET_NAME_PARTS = (
 _MASK = "***"
 
 
-def storage_options(env: Mapping[str, str], uri: str, side: str) -> dict[str, Any]:
+@dataclass(frozen=True)
+class StorageSettings:
+    """One side's storage options, as given on the command line or in the environment.
+
+    Parameters
+    ----------
+    aws_profile : str, optional
+        ``--<side>-aws-profile``: the AWS profile for this side, from ``~/.aws``.
+    s3_endpoint_url : str, optional
+        ``--<side>-s3-endpoint-url``: the S3 endpoint for this side.
+    s3_anon : bool, optional
+        ``--<side>-s3-anon``: whether to send unsigned requests; ``None`` decides
+        automatically (anonymous unless there are credentials).
+    storage_options : str, optional
+        ``--<side>-storage-options``: a JSON object of further fsspec options, merged
+        last, so it can override anything above.
+    """
+
+    aws_profile: str | None = None
+    s3_endpoint_url: str | None = None
+    s3_anon: bool | None = None
+    storage_options: str | None = None
+
+
+def side_variable(side: str, name: str) -> str:
+    """Name the environment variable of one side's storage option.
+
+    Parameters
+    ----------
+    side : {'input', 'output'}
+        The side.
+    name : str
+        The option without the side, e.g. ``'AWS_PROFILE'``.
+
+    Returns
+    -------
+    str
+        E.g. ``'MLCAST_INPUT_AWS_PROFILE'``, the variable of ``--input-aws-profile``.
+    """
+    return f"{ENV_PREFIX}_{side.upper()}_{name}"
+
+
+def storage_options(
+    side: str, uri: str, settings: StorageSettings | None = None, env: Mapping[str, str] | None = None
+) -> dict[str, Any]:
     """Build the fsspec storage options for one side.
 
     Parameters
     ----------
-    env : mapping of str to str
-        Environment to read.
+    side : {'input', 'output'}
+        Which side is being configured, for the messages.
     uri : str
         The store URI, whose scheme decides which options apply.
-    side : {'SRC', 'DST'}
-        Which side is being configured; also the environment variable prefix.
+    settings : StorageSettings, optional
+        The side's own options. Defaults to none at all.
+    env : mapping of str to str, optional
+        The environment, for the standard AWS variables that count as credentials.
+        Defaults to :data:`os.environ`; tests pass a dict.
 
     Returns
     -------
@@ -154,35 +182,52 @@ def storage_options(env: Mapping[str, str], uri: str, side: str) -> dict[str, An
     Raises
     ------
     ConfigError
-        If ``<side>_STORAGE_OPTIONS`` is not a JSON object, or ``<side>_S3_ANON`` is
-        not a boolean.
+        If the side's storage options are not a JSON object.
     """
+    settings = settings or StorageSettings()
+    env = os.environ if env is None else env
     scheme = urlsplit(uri).scheme.lower()
     options: dict[str, Any] = {}
 
     if scheme in S3_SCHEMES:
-        options.update(_s3_options(env, side))
-    elif _s3_variables_set(env, side):
-        logger.warning(
-            f"{side}_AWS_PROFILE / {side}_S3_ENDPOINT_URL / {side}_S3_ANON are set but "
-            f"{uri} is not an S3 URI; ignoring them"
-        )
+        if settings.aws_profile:
+            options["profile"] = settings.aws_profile
+        # Usually unset: the endpoint is better carried by the profile in ~/.aws/config.
+        if settings.s3_endpoint_url:
+            options["client_kwargs"] = {"endpoint_url": settings.s3_endpoint_url}
+        if settings.s3_anon is not None:
+            options["anon"] = settings.s3_anon
+    elif settings.aws_profile or settings.s3_endpoint_url or settings.s3_anon is not None:
+        names = ", ".join(side_variable(side, name) for name in ("AWS_PROFILE", "S3_ENDPOINT_URL", "S3_ANON"))
+        logger.warning(f"Some of {names} are set but {uri} is not an S3 URI; ignoring them")
 
     # Merged last, so it can override anything above and reach options that have no
-    # dedicated variable of their own.
-    options.update(_extra(env, side))
+    # dedicated option of their own.
+    options.update(_extra(side, settings.storage_options))
 
     if scheme in S3_SCHEMES and "anon" not in options:
-        options["anon"] = not _has_credentials(env, side, options)
-
-    if options:
-        logger.info(f"{side} storage options: {redact(options)}")
-        if options.get("anon"):
-            logger.info(
-                f"{side} is using anonymous access; set {side}_AWS_PROFILE (or supply "
-                f"credentials) if the bucket is not public"
-            )
+        options["anon"] = not _has_credentials(env, options)
     return options
+
+
+def log_storage_options(side: str, options: Mapping[str, Any]) -> None:
+    """Log the storage options one side resolved to, with credentials masked.
+
+    Parameters
+    ----------
+    side : {'input', 'output'}
+        The side.
+    options : mapping
+        What :func:`storage_options` returned for it. Nothing is logged when empty.
+    """
+    if not options:
+        return
+    logger.info(f"The {side} storage options: {redact(options)}")
+    if options.get("anon"):
+        logger.info(
+            f"The {side} store is using anonymous access; set {side_variable(side, 'AWS_PROFILE')} "
+            "(or supply credentials) if the bucket is not public"
+        )
 
 
 def storage_exceptions() -> tuple[type[BaseException], ...]:
@@ -219,13 +264,14 @@ def storage_error(
     options: Mapping[str, Any] | None,
     action: str,
     exc: BaseException,
+    env: Mapping[str, str] | None = None,
 ) -> StorageError:
     """Describe a failure to reach one store, with a hint at what to check.
 
     Parameters
     ----------
-    side : {'SRC', 'DST'}
-        Which store failed; also the prefix of the variables that configure it.
+    side : {'input', 'output'}
+        Which store failed; also the prefix of the options that configure it.
     uri : str
         The store URI.
     options : mapping or None
@@ -235,6 +281,9 @@ def storage_error(
         What was being attempted, e.g. ``'open'``, ``'read'``, ``'write'``.
     exc : BaseException
         The underlying error.
+    env : mapping of str to str, optional
+        The environment, for where the endpoint came from. Defaults to
+        :data:`os.environ`.
 
     Returns
     -------
@@ -242,8 +291,9 @@ def storage_error(
         An error naming the side, the URI and the underlying error, followed by what
         to check. The caller raises it ``from exc``.
     """
-    headline = f"Could not {action} the {SIDES[side]} store {uri!r}: {_describe(exc)}"
-    return StorageError(format_problems(headline, _hints(side, uri, options or {})))
+    env = os.environ if env is None else env
+    headline = f"Could not {action} the {side} store {uri!r}: {_describe(exc)}"
+    return StorageError(format_problems(headline, _hints(side, uri, options or {}, env)))
 
 
 @contextmanager
@@ -252,7 +302,7 @@ def storage_errors(side: str, uri: str, options: Mapping[str, Any] | None, actio
 
     Parameters
     ----------
-    side : {'SRC', 'DST'}
+    side : {'input', 'output'}
         Which store is being used.
     uri : str
         The store URI.
@@ -309,28 +359,30 @@ def _describe(exc: BaseException) -> str:
     return text
 
 
-def _hints(side: str, uri: str, options: Mapping[str, Any]) -> list[str]:
+def _hints(side: str, uri: str, options: Mapping[str, Any], env: Mapping[str, str]) -> list[str]:
     """Suggest what to check after a store could not be reached.
 
     Parameters
     ----------
-    side : {'SRC', 'DST'}
+    side : {'input', 'output'}
         Which store failed.
     uri : str
         The store URI, whose scheme decides which hints apply.
     options : mapping
         The storage options in effect for that store.
+    env : mapping of str to str
+        The environment, for an endpoint set by a standard AWS variable.
 
     Returns
     -------
     list of str
         One or more hints. For S3 they say whether access was anonymous — the default
         without credentials, see the module docstring — and where the endpoint came
-        from, naming the ``<side>_*`` variables that change it.
+        from, naming the ``MLCAST_<SIDE>_*`` variables that change it.
     """
     scheme = urlsplit(uri).scheme.lower()
     if scheme in _LOCAL_SCHEMES:
-        if side == "SRC":
+        if side == "input":
             return [
                 "check that the user running this process can read every file in the store; "
                 "in a container, also check the volume mount"
@@ -341,173 +393,80 @@ def _hints(side: str, uri: str, options: Mapping[str, Any]) -> list[str]:
         ]
 
     if scheme not in S3_SCHEMES:
-        return [f"check the credentials for {scheme}:// and any {side}_STORAGE_OPTIONS"]
+        return [f"check the credentials for {scheme}:// and any {side_variable(side, 'STORAGE_OPTIONS')}"]
 
+    profile_var = side_variable(side, "AWS_PROFILE")
     hints: list[str] = []
     if options.get("anon"):
         hints.append(
-            f"{side} is using anonymous access, the default when no credentials are "
-            f"found; if the bucket is not public, set {side}_AWS_PROFILE (or "
-            f"{side}_AWS_ACCESS_KEY_ID and {side}_AWS_SECRET_ACCESS_KEY)"
+            f"the {side} store is using anonymous access, the default when no credentials are "
+            f"found; if the bucket is not public, set {profile_var} (or AWS_PROFILE, or "
+            f"AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)"
         )
     else:
         profile = options.get("profile")
         source = f"profile {profile!r}" if profile else "the credentials found"
         hints.append(
-            f"{side} is signing requests with {source}; check they are valid and allowed "
-            f"to {'read' if side == 'SRC' else 'write'} this bucket ({side}_AWS_PROFILE, "
-            f"{side}_AWS_ACCESS_KEY_ID, or {side}_S3_ANON=true for a public bucket)"
+            f"the {side} store is signing requests with {source}; check they are valid and allowed "
+            f"to {'read' if side == 'input' else 'write'} this bucket ({profile_var}, AWS_PROFILE, "
+            f"AWS_ACCESS_KEY_ID, or {side_variable(side, 'S3_ANON')}=true for a public bucket)"
         )
 
+    endpoint_var = side_variable(side, "S3_ENDPOINT_URL")
     client_kwargs = options.get("client_kwargs")
     endpoint = options.get("endpoint_url") or (
         client_kwargs.get("endpoint_url") if isinstance(client_kwargs, Mapping) else None
     )
+    ambient = next((name for name in AMBIENT_ENDPOINT_VARS if env.get(name, "").strip()), None)
     if endpoint:
         hints.append(f"check that the endpoint {endpoint} is reachable from here")
+    elif ambient:
+        hints.append(
+            f"check that the endpoint {env[ambient].strip()} (from {ambient}) is reachable from here; "
+            f"{endpoint_var} overrides it for the {side} store"
+        )
     else:
         hints.append(
-            "no endpoint is set in the environment, so it comes from the profile's "
-            f"endpoint_url in ~/.aws/config, or is AWS itself; {side}_S3_ENDPOINT_URL "
-            "overrides it"
+            "no endpoint is set, so it comes from the profile's endpoint_url in ~/.aws/config, "
+            f"or is AWS itself; {endpoint_var} sets it"
         )
     return hints
 
 
-def _s3_options(env: Mapping[str, str], side: str) -> dict[str, Any]:
-    """Collect the S3-specific options for one side.
+def _has_credentials(env: Mapping[str, str], options: Mapping[str, Any]) -> bool:
+    """Decide whether a side has credentials, and so should sign its requests.
 
     Parameters
     ----------
     env : mapping of str to str
-        Environment to read.
-    side : str
-        Variable prefix, ``'SRC'`` or ``'DST'``.
-
-    Returns
-    -------
-    dict
-        Any of ``profile``, ``client_kwargs``, ``key``, ``secret``, ``token`` and
-        ``anon`` that the environment specifies. ``anon`` appears only when set
-        explicitly; otherwise it is derived later, once the JSON options are known.
-
-    Raises
-    ------
-    ConfigError
-        If ``<side>_S3_ANON`` is not a boolean.
-    """
-    options: dict[str, Any] = {}
-
-    profile = _get(env, side, "AWS_PROFILE")
-    if profile:
-        options["profile"] = profile
-
-    # Usually unset: the endpoint is better carried by the profile in ~/.aws/config.
-    endpoint = _get(env, side, "S3_ENDPOINT_URL", "AWS_ENDPOINT_URL")
-    if endpoint:
-        options["client_kwargs"] = {"endpoint_url": endpoint}
-
-    for option, name in (
-        ("key", "AWS_ACCESS_KEY_ID"),
-        ("secret", "AWS_SECRET_ACCESS_KEY"),
-        ("token", "AWS_SESSION_TOKEN"),
-    ):
-        # Only the prefixed spellings: unprefixed AWS_* keys are already ambient, and
-        # boto picks them up itself.
-        value = env.get(f"{side}_{name}", "").strip()
-        if value:
-            options[option] = value
-
-    anon = _get(env, side, "S3_ANON")
-    if anon is not None:
-        options["anon"] = parse_bool(anon, f"{side}_S3_ANON")
-
-    return options
-
-
-def _s3_variables_set(env: Mapping[str, str], side: str) -> bool:
-    """Report whether any S3-only variable is set for this side.
-
-    Parameters
-    ----------
-    env : mapping of str to str
-        Environment to read.
-    side : str
-        Variable prefix, ``'SRC'`` or ``'DST'``.
-
-    Returns
-    -------
-    bool
-        True when at least one prefixed S3 variable is set, which is worth warning
-        about if the URI turns out not to be an S3 one.
-    """
-    names = ("AWS_PROFILE", "S3_ENDPOINT_URL", "S3_ANON", "AWS_ACCESS_KEY_ID")
-    return any(env.get(f"{side}_{name}", "").strip() for name in names)
-
-
-def _has_credentials(env: Mapping[str, str], side: str, options: Mapping[str, Any]) -> bool:
-    """Decide whether this side has credentials, and so should sign its requests.
-
-    Parameters
-    ----------
-    env : mapping of str to str
-        Environment to read.
-    side : str
-        Variable prefix, ``'SRC'`` or ``'DST'``.
+        The environment, for the standard AWS variables.
     options : mapping
         The storage options resolved so far, including the JSON escape hatch.
 
     Returns
     -------
     bool
-        True when a profile, explicit keys, or ambient role credentials are present.
-        False means the request should go out unsigned.
+        True when a profile, explicit keys, or ambient credentials (a profile, keys or
+        role in the standard AWS variables) are present. False means the request
+        should go out unsigned.
     """
     if any(options.get(name) for name in _CREDENTIAL_OPTIONS):
         return True
     client_kwargs = options.get("client_kwargs")
     if isinstance(client_kwargs, Mapping) and any(client_kwargs.get(name) for name in _CLIENT_CREDENTIAL_KWARGS):
         return True
-    if _get(env, side, "AWS_PROFILE"):
-        return True
     return any(env.get(name, "").strip() for name in AMBIENT_CREDENTIAL_VARS)
 
 
-def _get(env: Mapping[str, str], side: str, *names: str) -> str | None:
-    """Read one side-specific variable, falling back to the unprefixed spellings.
+def _extra(side: str, raw: str | None) -> dict[str, Any]:
+    """Parse the JSON escape hatch for options with no dedicated option.
 
     Parameters
     ----------
-    env : mapping of str to str
-        Environment to read.
-    side : str
-        Variable prefix, ``'SRC'`` or ``'DST'``.
-    *names : str
-        Variable names without the prefix, in order of preference.
-
-    Returns
-    -------
-    str or None
-        The first of ``<side>_<name>`` (all names, in order) that is set, then the
-        first bare ``<name>`` that is set — so a plain ``AWS_PROFILE`` still applies to
-        both sides — otherwise ``None``.
-    """
-    for key in [f"{side}_{name}" for name in names] + list(names):
-        value = env.get(key, "").strip()
-        if value:
-            return value
-    return None
-
-
-def _extra(env: Mapping[str, str], side: str) -> dict[str, Any]:
-    """Parse the JSON escape hatch for options with no dedicated variable.
-
-    Parameters
-    ----------
-    env : mapping of str to str
-        Environment to read.
-    side : str
-        Variable prefix, ``'SRC'`` or ``'DST'``.
+    side : {'input', 'output'}
+        The side, for the error message.
+    raw : str or None
+        The ``--<side>-storage-options`` value.
 
     Returns
     -------
@@ -519,8 +478,8 @@ def _extra(env: Mapping[str, str], side: str) -> dict[str, Any]:
     ConfigError
         If the value is not valid JSON, or is JSON but not an object.
     """
-    key = f"{side}_STORAGE_OPTIONS"
-    raw = env.get(key, "").strip()
+    key = side_variable(side, "STORAGE_OPTIONS")
+    raw = (raw or "").strip()
     if not raw:
         return {}
     try:
@@ -532,32 +491,30 @@ def _extra(env: Mapping[str, str], side: str) -> dict[str, Any]:
     return parsed
 
 
-def parse_bool(value: str, key: str) -> bool:
-    """Parse a boolean environment variable.
+def redact_json(raw: str | None) -> str | None:
+    """Mask the credentials in a JSON object of storage options, for the log.
 
     Parameters
     ----------
-    value : str
-        The raw value.
-    key : str
-        Variable name, used in the error message.
+    raw : str or None
+        A ``--<side>-storage-options`` value as given.
 
     Returns
     -------
-    bool
-        The parsed value.
-
-    Raises
-    ------
-    ConfigError
-        If the value is not a recognised boolean spelling.
+    str or None
+        The object re-serialised by :func:`redact`; ``None`` when unset; and
+        ``'*** (not a JSON object)'`` when it does not parse as one, since a malformed
+        value may still hold a secret.
     """
-    lowered = value.strip().lower()
-    if lowered in ("1", "true", "yes", "on"):
-        return True
-    if lowered in ("0", "false", "no", "off"):
-        return False
-    raise ConfigError(f"{key} must be a boolean such as 'true' or 'false', got {value!r}")
+    if raw is None or not raw.strip():
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = None
+    if not isinstance(parsed, dict):
+        return f"{_MASK} (not a JSON object)"
+    return json.dumps(redact(parsed))
 
 
 def redact(options: Mapping[str, Any]) -> dict[str, Any]:

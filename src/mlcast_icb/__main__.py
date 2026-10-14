@@ -1,8 +1,12 @@
 """Command line: ``mlcast-icb {run,serve,bundle,info,build,build-base}``.
 
-``run`` and ``serve`` are what an image executes; they take no options, since a
-container is configured through its environment. ``bundle``, ``info``, ``build`` and
-``build-base`` are build-time tools, configured through options.
+``run`` and ``serve`` are what an image executes. Each of their options ``--some-option``
+can also be set with the environment variable ``MLCAST_SOME_OPTION`` (see
+:mod:`mlcast_icb.options`), since a container is usually configured through its
+environment; their arguments go to their own parsers. ``bundle``, ``info``, ``build`` and
+``build-base`` are developer tools, configured through their options only: they read no
+``MLCAST_*`` variable (except that ``info`` defaults to ``$MLCAST_MODEL_DIR``, the
+image's bundle), and do not check them either.
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ from collections.abc import Sequence
 
 from loguru import logger
 
-from mlcast_icb import __version__
+from mlcast_icb import ENV_PREFIX, __version__
 from mlcast_icb.errors import ConfigError, MlcastIcbError
 
 #: Distribution name, as printed by ``--version``.
@@ -36,17 +40,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"{DISTRIBUTION} {__version__}")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
+    # Listed here for the help only: main() hands their arguments to their own parsers.
     sub.add_parser(
         "run",
-        help="batch forecast, zarr in and out (configured by environment variables)",
-        description="Forecast from INPUT_ZARR into OUTPUT_ZARR. Configured entirely by environment variables; "
-        "see the README.",
+        help="batch forecast, zarr in and out (options or MLCAST_* variables; see `run --help`)",
+        add_help=False,
     )
     sub.add_parser(
         "serve",
-        help="HTTP server, IRENE-compatible (configured by environment variables)",
-        description="Serve forecasts over HTTP (POST /predict with a netCDF). Configured entirely by environment "
-        "variables; see the README. Needs the `serve` extra.",
+        help="HTTP server, IRENE-compatible (options or MLCAST_* variables; see `serve --help`)",
+        add_help=False,
     )
 
     bundle = sub.add_parser(
@@ -67,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     info = sub.add_parser("info", help="print a bundle's manifest")
     info.add_argument(
-        "model_dir", nargs="?", help="bundle directory (default: $MODEL_DIR, or /model when that is unset)"
+        "model_dir", nargs="?", help="bundle directory (default: $MLCAST_MODEL_DIR, or /model when that is unset)"
     )
     info.add_argument("--verify", action="store_true", help="also check the checksum and load the model on CPU")
 
@@ -142,24 +145,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         0 on success, a code from :mod:`mlcast_icb.errors` on a known failure, 2 for a
         usage error, 1 for anything unexpected.
     """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "run":
+        from mlcast_icb.run import main as run_main
+
+        return run_main(argv[1:])
+    if argv and argv[0] == "serve":
+        from mlcast_icb.serve import main as serve_main
+
+        return serve_main(argv[1:])
+
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:  # --help, --version and usage errors
         return int(exc.code or 0)
 
-    if args.command == "run":
-        from mlcast_icb.run import main as run_main
-
-        return run_main()
-    if args.command == "serve":
-        from mlcast_icb.serve import main as serve_main
-
-        return serve_main()
-
     from mlcast_icb.logs import configure_logging
 
-    configure_logging(os.environ.get("LOG_LEVEL", "INFO").strip().upper() or "INFO")
+    configure_logging("INFO")
     if args.command is None:
         parser.print_help(sys.stderr)
         return ConfigError.exit_code
@@ -202,7 +206,7 @@ def _info(args: argparse.Namespace) -> int:
     """Print a bundle's manifest as JSON on stdout, optionally verifying the bundle."""
     from mlcast_icb.bundle import DEFAULT_MODEL_DIR, load_bundle, read_manifest
 
-    model_dir = args.model_dir or os.environ.get("MODEL_DIR", "").strip() or DEFAULT_MODEL_DIR
+    model_dir = args.model_dir or os.environ.get(f"{ENV_PREFIX}_MODEL_DIR", "").strip() or DEFAULT_MODEL_DIR
     if args.verify:
         _, _, manifest = load_bundle(model_dir, "cpu")
         logger.info(f"Bundle {model_dir} verified: checksum matches and the model loads")

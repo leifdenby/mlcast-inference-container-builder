@@ -26,7 +26,27 @@ def configure_logging(level: str) -> None:
         logger.add(sys.stderr, level=level, format=LOG_FORMAT, colorize=sys.stderr.isatty())
     except ValueError:
         logger.add(sys.stderr, level="INFO", format=LOG_FORMAT, colorize=sys.stderr.isatty())
-        logger.warning(f"LOG_LEVEL={level!r} is not a known level; using INFO")
+        logger.warning(f"Log level {level!r} is not a known level; using INFO")
+
+
+def log_lines(headline: str, lines: list[str]) -> None:
+    """Log a headline and then one indented record per line.
+
+    Parameters
+    ----------
+    headline : str
+        The first record, e.g. ``'Effective configuration (defaults included):'``.
+    lines : list of str
+        The lines, e.g. from :func:`mlcast_icb.envargs.config_lines`.
+
+    Notes
+    -----
+    One record per line, as :func:`log_settings` explains.
+    """
+    caller = logger.opt(depth=1)  # attribute the records to the module that logs them
+    caller.info(headline)
+    for line in lines:
+        caller.info(f"  {line}")
 
 
 def log_settings(headline: str, settings: dict[str, str]) -> None:

@@ -9,8 +9,9 @@ multipart ``file`` upload and the query parameters ``variable``, ``forecast_step
 :func:`~mlcast_icb.upstream.forecast.forecast` instead, optionally reduced to ensemble
 products (mean, quantiles, exceedance probabilities).
 
-Configuration comes from environment variables, like ``run``: every variable is parsed
-before anything is loaded and every problem is reported at once (exit 2). The device is
+Configuration comes from options mirrored by ``MLCAST_*`` environment variables, like
+``run`` (see :mod:`mlcast_icb.options`): every value is checked before anything is
+loaded and every problem is reported at once (exit 2). The device is
 resolved (exit 4) and the bundle loaded (exit 6) before the port is bound, so a broken
 image never accepts a connection. One warm-up forward pass then runs in the background;
 ``/readyz`` answers 200 only after it.
@@ -20,7 +21,7 @@ Concurrency
 Inference runs in the threadpool, never on the event loop, so ``/health``, ``/healthz``,
 ``/readyz`` and ``/metrics`` answer while a forecast runs. One lock serialises the
 model: the GPU holds one forecast at a time, and the seeded forecast's global RNG state
-(see :mod:`mlcast_icb.upstream.forecast`) is only safe that way. At most ``1 + MAX_QUEUE``
+(see :mod:`mlcast_icb.upstream.forecast`) is only safe that way. At most ``1 + --max-queue``
 predictions are in progress at once; a request beyond that is answered 429 at once,
 with a ``Retry-After`` estimate, rather than queueing without bound.
 """
@@ -54,14 +55,22 @@ from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Counter, G
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
-from mlcast_icb import __version__
+from mlcast_icb import ENV_PREFIX, __version__
 from mlcast_icb.bundle import DEFAULT_MODEL_DIR, load_bundle, manifest_summary, mlcast_version
 from mlcast_icb.device import DEVICES, select_device
-from mlcast_icb.envvars import warn_unknown_env_vars
 from mlcast_icb.errors import ConfigError, InputError, MlcastIcbError, PayloadTooLargeError, format_problems
 from mlcast_icb.io.netcdf_io import SPOOL_MAX_MEMORY, read_netcdf_bytes, write_netcdf
-from mlcast_icb.logs import log_settings
-from mlcast_icb.run import _attempt, _get_choice, _get_int
+from mlcast_icb.logs import log_lines, log_settings
+from mlcast_icb.options import (
+    ParsedOptions,
+    attempt,
+    blank_to_none,
+    get_choice,
+    get_int,
+    get_positive_float,
+    log_level,
+    parse_options,
+)
 from mlcast_icb.upstream.forecast import (
     COMPATIBLE_STANDARD_NAMES,
     ForecastInputError,
@@ -72,23 +81,6 @@ from mlcast_icb.upstream.spec import InferenceSpec
 
 #: Distribution name, as logged at startup.
 DISTRIBUTION = "mlcast-inference-container-builder"
-
-#: The variables ``serve`` reads, in the order the README documents them.
-SERVE_VARIABLES = (
-    "MODEL_DIR",
-    "DEVICE",
-    "HOST",
-    "PORT",
-    "MAX_UPLOAD_MB",
-    "MAX_QUEUE",
-    "REQUEST_TIMEOUT",
-    "MAX_FORECAST_STEPS",
-    "MAX_ENSEMBLE_SIZE",
-    "LOG_LEVEL",
-)
-
-#: Every variable ``serve`` reads, for the typo check.
-KNOWN_VARIABLES = frozenset(SERVE_VARIABLES)
 
 #: IRENE's name for the input variable, the default of ``variable=``.
 IRENE_VARIABLE = "RR"
@@ -177,13 +169,13 @@ class ServeConfig:
         return self.max_upload_mb * 1024 * 1024
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> ServeConfig:
-        """Build the configuration from environment variables.
+    def from_options(cls, parsed: ParsedOptions) -> ServeConfig:
+        """Validate the parsed options of ``serve``.
 
         Parameters
         ----------
-        env : mapping of str to str, optional
-            Environment to read. Defaults to :data:`os.environ`; tests pass a dict.
+        parsed : ParsedOptions
+            The options, from :func:`~mlcast_icb.options.parse_options`.
 
         Returns
         -------
@@ -192,46 +184,73 @@ class ServeConfig:
         Raises
         ------
         ConfigError
-            Listing every problem found.
+            Listing every problem found, each named as it was given (its variable, or
+            its option).
         """
-        env = os.environ if env is None else env
+        args, label = parsed.args, parsed.label
         problems: list[str] = []
         defaults = cls()
 
-        device = _attempt(problems, lambda: _get_choice(env, "DEVICE", DEVICES, defaults.device))
-        port = _attempt(problems, lambda: _get_int(env, "PORT", minimum=1))
-        if port is not None and port > 65535:
-            problems.append(f"PORT must be at most 65535, got {port}")
-        max_upload_mb = _attempt(problems, lambda: _get_int(env, "MAX_UPLOAD_MB", minimum=1))
-        max_queue = _attempt(problems, lambda: _get_int(env, "MAX_QUEUE", minimum=0))
-        request_timeout = _attempt(problems, lambda: _get_positive_float(env, "REQUEST_TIMEOUT"))
-        max_forecast_steps = _attempt(problems, lambda: _get_int(env, "MAX_FORECAST_STEPS", minimum=1))
-        max_ensemble_size = _attempt(problems, lambda: _get_int(env, "MAX_ENSEMBLE_SIZE", minimum=1))
+        device = attempt(problems, lambda: get_choice(args.device, label("device"), DEVICES, defaults.device))
+        port = attempt(problems, lambda: get_int(args.port, label("port"), minimum=1, maximum=65535))
+        max_upload_mb = attempt(problems, lambda: get_int(args.max_upload_mb, label("max_upload_mb"), minimum=1))
+        max_queue = attempt(problems, lambda: get_int(args.max_queue, label("max_queue"), minimum=0))
+        request_timeout = attempt(problems, lambda: get_positive_float(args.request_timeout, label("request_timeout")))
+        max_forecast_steps = attempt(
+            problems, lambda: get_int(args.max_forecast_steps, label("max_forecast_steps"), minimum=1)
+        )
+        max_ensemble_size = attempt(
+            problems, lambda: get_int(args.max_ensemble_size, label("max_ensemble_size"), minimum=1)
+        )
 
         if len(problems) == 1:
             raise ConfigError(problems[0])
         if problems:
-            raise ConfigError(format_problems(f"The environment configuration has {len(problems)} problems:", problems))
+            raise ConfigError(format_problems(f"The configuration has {len(problems)} problems:", problems))
 
         def pick(value: Any, default: Any) -> Any:
             return default if value is None else value
 
         return cls(
-            model_dir=env.get("MODEL_DIR", "").strip() or DEFAULT_MODEL_DIR,
+            model_dir=blank_to_none(args.model_dir) or DEFAULT_MODEL_DIR,
             device=device,
-            host=env.get("HOST", "").strip() or defaults.host,
+            host=blank_to_none(args.host) or defaults.host,
             port=pick(port, defaults.port),
             max_upload_mb=pick(max_upload_mb, defaults.max_upload_mb),
             max_queue=pick(max_queue, defaults.max_queue),
             request_timeout=request_timeout,
             max_forecast_steps=pick(max_forecast_steps, defaults.max_forecast_steps),
             max_ensemble_size=pick(max_ensemble_size, defaults.max_ensemble_size),
-            log_level=env.get("LOG_LEVEL", "INFO").strip().upper() or "INFO",
+            log_level=log_level(args.log_level),
         )
+
+    @classmethod
+    def from_command_line(cls, argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None) -> ServeConfig:
+        """Parse and validate the options of ``serve`` from a command line and an environment.
+
+        Parameters
+        ----------
+        argv : sequence of str, optional
+            The arguments after ``serve``. Defaults to none.
+        env : mapping of str to str, optional
+            The environment. Defaults to :data:`os.environ`; tests pass a dict.
+
+        Returns
+        -------
+        ServeConfig
+
+        Raises
+        ------
+        SystemExit
+            Exit code 2 for what argparse rejects.
+        ConfigError
+            For invalid values (see :meth:`from_options`).
+        """
+        return cls.from_options(parse_options("serve", argv, env))
 
 
 def describe_config(config: ServeConfig) -> dict[str, str]:
-    """Render the effective configuration for the startup log, keyed by variable, in :data:`SERVE_VARIABLES` order.
+    """Render the effective configuration for the startup log.
 
     Parameters
     ----------
@@ -241,35 +260,22 @@ def describe_config(config: ServeConfig) -> dict[str, str]:
     Returns
     -------
     dict of str to str
+        One entry per option of ``serve``, keyed by its ``dest``, in the parser's order.
     """
     return {
-        "MODEL_DIR": config.model_dir,
-        "DEVICE": config.device,
-        "HOST": config.host,
-        "PORT": str(config.port),
-        "MAX_UPLOAD_MB": str(config.max_upload_mb),
-        "MAX_QUEUE": str(config.max_queue),
-        "REQUEST_TIMEOUT": "unset (wait for the model as long as it takes)"
+        "model_dir": config.model_dir,
+        "device": config.device,
+        "host": config.host,
+        "port": str(config.port),
+        "max_upload_mb": str(config.max_upload_mb),
+        "max_queue": str(config.max_queue),
+        "request_timeout": "unset (wait for the model as long as it takes)"
         if config.request_timeout is None
         else f"{config.request_timeout:g} s",
-        "MAX_FORECAST_STEPS": str(config.max_forecast_steps),
-        "MAX_ENSEMBLE_SIZE": str(config.max_ensemble_size),
-        "LOG_LEVEL": config.log_level,
+        "max_forecast_steps": str(config.max_forecast_steps),
+        "max_ensemble_size": str(config.max_ensemble_size),
+        "log_level": config.log_level,
     }
-
-
-def _get_positive_float(env: Mapping[str, str], key: str) -> float | None:
-    """Read an optional positive number; ``None`` when unset."""
-    raw = env.get(key, "").strip()
-    if not raw:
-        return None
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise ConfigError(f"{key} must be a number of seconds, got {raw!r}") from exc
-    if not math.isfinite(value) or value <= 0:
-        raise ConfigError(f"{key} must be a positive number of seconds, got {raw!r}")
-    return value
 
 
 # --- the model and its gate ------------------------------------------------------------
@@ -323,7 +329,7 @@ class QueueFullError(Exception):
 
 
 class QueueTimeoutError(Exception):
-    """A prediction waited longer than ``REQUEST_TIMEOUT`` for the model (HTTP 503)."""
+    """A prediction waited longer than ``--request-timeout`` for the model (HTTP 503)."""
 
 
 class Metrics:
@@ -886,11 +892,11 @@ def create_app(config: ServeConfig, loaded: LoadedModel | None = None) -> FastAP
         response_class=FileResponse,
         responses={
             200: {"content": {NETCDF_MEDIA_TYPE: {}}, "description": "The forecast, as `predictions.nc`"},
-            413: {"description": "Upload larger than MAX_UPLOAD_MB"},
+            413: {"description": "Upload larger than MLCAST_MAX_UPLOAD_MB"},
             415: {"description": "Raw body with an unsupported Content-Type"},
             422: {"description": "Invalid parameters, or an input the model cannot use"},
             429: {"description": "Too many predictions in progress; retry after Retry-After seconds"},
-            503: {"description": "Waited longer than REQUEST_TIMEOUT for the model"},
+            503: {"description": "Waited longer than MLCAST_REQUEST_TIMEOUT for the model"},
         },
         openapi_extra={
             "requestBody": {
@@ -977,7 +983,7 @@ def create_app(config: ServeConfig, loaded: LoadedModel | None = None) -> FastAP
         except QueueTimeoutError as exc:
             raise HTTPException(
                 status_code=503,
-                detail=f"The model is busy: {exc} (REQUEST_TIMEOUT); retry later.",
+                detail=f"The model is busy: {exc} (MLCAST_REQUEST_TIMEOUT); retry later.",
                 headers={"Retry-After": str(state.gate.retry_after())},
             ) from exc
         except PayloadTooLargeError as exc:
@@ -1353,11 +1359,11 @@ def configure_serve_logging(level: str) -> None:
         logger.add(sys.stderr, level=level, format=SERVE_LOG_FORMAT, colorize=colorize)
     except ValueError:
         logger.add(sys.stderr, level="INFO", format=SERVE_LOG_FORMAT, colorize=colorize)
-        logger.warning(f"LOG_LEVEL={level!r} is not a known level; using INFO")
+        logger.warning(f"Log level {level!r} is not a known level; using INFO")
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         std = logging.getLogger(name)
         std.handlers = [_InterceptHandler()]
-        std.setLevel(logging.DEBUG)  # loguru's sink filters by LOG_LEVEL
+        std.setLevel(logging.DEBUG)  # loguru's sink filters by the log level
         std.propagate = False
 
 
@@ -1372,33 +1378,40 @@ class _InterceptHandler(logging.Handler):
         logger.opt(depth=6, exception=record.exc_info).log(level, record.getMessage())
 
 
-def main(env: Mapping[str, str] | None = None) -> int:
-    """Run Mode 2 from the environment and return a process exit code.
+def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None) -> int:
+    """Run Mode 2 from the command line and the environment, and return a process exit code.
 
     Parameters
     ----------
+    argv : sequence of str, optional
+        The arguments after ``serve``. Defaults to none.
     env : mapping of str to str, optional
         Environment to read. Defaults to :data:`os.environ`.
 
     Returns
     -------
     int
-        0 after a clean shutdown; 2 for a configuration error, 4 for an unusable device
-        and 6 for a broken bundle, all before the port is bound; 1 if the server cannot
-        start (the port is taken, say) or for anything unexpected.
+        0 after a clean shutdown (and after ``--help``); 2 for a configuration error, 4
+        for an unusable device and 6 for a broken bundle, all before the port is bound;
+        1 if the server cannot start (the port is taken, say) or for anything unexpected.
     """
     env = os.environ if env is None else env
-    configure_serve_logging(env.get("LOG_LEVEL", "INFO").strip().upper() or "INFO")
+    configure_serve_logging(log_level(env.get(f"{ENV_PREFIX}_LOG_LEVEL")))
     logger.info(f"Starting {DISTRIBUTION} {__version__} (serve)")
-    warn_unknown_env_vars(KNOWN_VARIABLES, env)
     try:
-        config = ServeConfig.from_env(env)
+        parsed = parse_options("serve", argv, env)
+    except SystemExit as exc:  # argparse has printed the usage and the error, or the help
+        return int(exc.code or 0)
+    try:
+        config = ServeConfig.from_options(parsed)
     except MlcastIcbError as exc:
         logger.error(f"{exc}")
         return exc.exit_code
 
     configure_serve_logging(config.log_level)
-    log_settings("Effective configuration (defaults included):", describe_config(config))
+    log_lines("Effective configuration (defaults included):", parsed.config_lines(describe_config(config)))
+    for name in parsed.ignored:
+        logger.debug(f"Ignoring {name}: it is an option of `run`, not of `serve`")
     try:
         loaded = load_model(config)
     except MlcastIcbError as exc:

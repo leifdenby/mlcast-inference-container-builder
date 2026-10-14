@@ -24,7 +24,13 @@ import pytest
 import xarray as xr
 
 from mlcast_icb.errors import InputError, StorageError
-from mlcast_icb.io.storage import storage_error, storage_errors, storage_exceptions, storage_options
+from mlcast_icb.io.storage import (
+    StorageSettings,
+    storage_error,
+    storage_errors,
+    storage_exceptions,
+    storage_options,
+)
 from mlcast_icb.io.zarr_io import load_zarr, open_zarr, write_zarr
 
 try:
@@ -122,48 +128,57 @@ def test_message_names_side_uri_error_and_its_cause() -> None:
     exc = PermissionError("Access Denied")
     exc.__cause__ = cause
 
-    message = str(storage_error("SRC", "s3://bucket/in.zarr", {"anon": True}, "open", exc))
+    message = str(storage_error("input", "s3://bucket/in.zarr", {"anon": True}, "open", exc))
     assert message.startswith("Could not open the input store 's3://bucket/in.zarr': ")
     assert "PermissionError: Access Denied" in message
     assert "when calling the GetObject operation" in message
 
 
 def test_an_empty_error_message_still_names_the_type() -> None:
-    message = str(storage_error("DST", "/out.zarr", {}, "write", OSError()))
+    message = str(storage_error("output", "/out.zarr", {}, "write", OSError()))
     assert "Could not write the output store '/out.zarr': OSError" in message
 
 
 def test_local_hints_depend_on_the_side() -> None:
-    read = str(storage_error("SRC", "/data/in.zarr", {}, "open", PermissionError()))
-    write = str(storage_error("DST", "file:///data/out.zarr", {}, "write", PermissionError()))
+    read = str(storage_error("input", "/data/in.zarr", {}, "open", PermissionError()))
+    write = str(storage_error("output", "file:///data/out.zarr", {}, "write", PermissionError()))
     assert "can read every file" in read
     assert "read-only" in write
     assert "AWS" not in read + write
 
 
 def test_anonymous_s3_hint_names_the_side_variables() -> None:
-    message = str(storage_error("SRC", "s3://b/in.zarr", {"anon": True}, "open", OSError()))
-    assert "SRC is using anonymous access" in message
-    assert "SRC_AWS_PROFILE" in message
-    assert "SRC_S3_ENDPOINT_URL" in message
+    message = str(storage_error("input", "s3://b/in.zarr", {"anon": True}, "open", OSError(), env={}))
+    assert "the input store is using anonymous access" in message
+    assert "MLCAST_INPUT_AWS_PROFILE" in message
+    assert "MLCAST_INPUT_S3_ENDPOINT_URL" in message
+    assert "OUTPUT" not in message
 
 
 def test_signed_s3_hint_names_the_profile_and_endpoint() -> None:
     options = {"anon": False, "profile": "dmi-minio", "client_kwargs": {"endpoint_url": "https://s3.dmi.dk"}}
-    message = str(storage_error("DST", "s3://b/out.zarr", options, "write", OSError()))
-    assert "DST is signing requests with profile 'dmi-minio'" in message
+    message = str(storage_error("output", "s3://b/out.zarr", options, "write", OSError()))
+    assert "the output store is signing requests with profile 'dmi-minio'" in message
     assert "allowed to write this bucket" in message
+    assert "MLCAST_OUTPUT_S3_ANON=true" in message
     assert "https://s3.dmi.dk" in message
 
 
+def test_an_endpoint_from_the_standard_variables_is_named() -> None:
+    env = {"AWS_ENDPOINT_URL": "https://s3.example.org"}
+    message = str(storage_error("output", "s3://b/out.zarr", {"anon": True}, "write", OSError(), env=env))
+    assert "https://s3.example.org (from AWS_ENDPOINT_URL)" in message
+    assert "MLCAST_OUTPUT_S3_ENDPOINT_URL overrides it" in message
+
+
 def test_other_schemes_get_a_generic_hint() -> None:
-    message = str(storage_error("SRC", "gs://b/in.zarr", {}, "open", OSError()))
+    message = str(storage_error("input", "gs://b/in.zarr", {}, "open", OSError()))
     assert "gs://" in message
-    assert "SRC_STORAGE_OPTIONS" in message
+    assert "MLCAST_INPUT_STORAGE_OPTIONS" in message
 
 
 def test_the_storage_error_exit_code_is_5() -> None:
-    assert storage_error("SRC", "/in.zarr", {}, "open", OSError()).exit_code == 5
+    assert storage_error("input", "/in.zarr", {}, "open", OSError()).exit_code == 5
 
 
 # --- the context manager -------------------------------------------------------------
@@ -172,7 +187,7 @@ def test_the_storage_error_exit_code_is_5() -> None:
 def test_storage_errors_translates_and_chains() -> None:
     error = PermissionError("denied")
     with pytest.raises(StorageError, match="Could not read the input store '/in.zarr'") as info:
-        with storage_errors("SRC", "/in.zarr", None, "read"):
+        with storage_errors("input", "/in.zarr", None, "read"):
             raise error
     assert info.value.__cause__ is error
 
@@ -180,7 +195,7 @@ def test_storage_errors_translates_and_chains() -> None:
 def test_storage_errors_unwraps_a_group_of_storage_failures() -> None:
     group = ExceptionGroup("shard", [ExceptionGroup("inner", [PermissionError("denied")])])
     with pytest.raises(StorageError, match="PermissionError: denied") as info:
-        with storage_errors("DST", "/out.zarr", None, "write"):
+        with storage_errors("output", "/out.zarr", None, "write"):
             raise group
     assert info.value.__cause__ is group
 
@@ -188,13 +203,13 @@ def test_storage_errors_unwraps_a_group_of_storage_failures() -> None:
 def test_storage_errors_leaves_a_mixed_group_alone() -> None:
     group = ExceptionGroup("mixed", [PermissionError("denied"), RuntimeError("bug")])
     with pytest.raises(ExceptionGroup):
-        with storage_errors("SRC", "/in.zarr", None, "read"):
+        with storage_errors("input", "/in.zarr", None, "read"):
             raise group
 
 
 def test_storage_errors_leaves_a_programming_error_alone() -> None:
     with pytest.raises(RuntimeError, match="a bug"):
-        with storage_errors("SRC", "/in.zarr", None, "read"):
+        with storage_errors("input", "/in.zarr", None, "read"):
             raise RuntimeError("a bug")
 
 
@@ -331,13 +346,13 @@ def test_read_only_output_directory_is_a_storage_error(tmp_path: Path, make_data
 def test_s3_input_without_credentials_is_a_storage_error() -> None:
     pytest.importorskip("s3fs")
     uri = "s3://bucket/in.zarr"
-    env = {"SRC_S3_ANON": "false", "SRC_S3_ENDPOINT_URL": closed_port_endpoint(), "SRC_STORAGE_OPTIONS": ONE_ATTEMPT}
+    settings = StorageSettings(s3_anon=False, s3_endpoint_url=closed_port_endpoint(), storage_options=ONE_ATTEMPT)
     with pytest.raises(StorageError) as info:
-        open_zarr(uri, storage_options(env, uri, "SRC"))
+        open_zarr(uri, storage_options("input", uri, settings))
     message = str(info.value)
     assert "Could not open the input store 's3://bucket/in.zarr'" in message
     assert "NoCredentialsError" in message
-    assert "SRC_AWS_PROFILE" in message
+    assert "MLCAST_INPUT_AWS_PROFILE" in message
 
 
 @pytest.mark.usefixtures("no_aws")
@@ -345,11 +360,11 @@ def test_s3_output_endpoint_unreachable_is_a_storage_error(make_dataset: Callabl
     pytest.importorskip("s3fs")
     endpoint = closed_port_endpoint()
     uri = "s3://bucket/out.zarr"
-    env = {"DST_S3_ENDPOINT_URL": endpoint, "DST_STORAGE_OPTIONS": ONE_ATTEMPT}
+    settings = StorageSettings(s3_endpoint_url=endpoint, storage_options=ONE_ATTEMPT)
     with pytest.raises(StorageError) as info:
-        write_zarr(make_dataset(), uri, storage_options(env, uri, "DST"), zarr_format=3)
+        write_zarr(make_dataset(), uri, storage_options("output", uri, settings), zarr_format=3)
     message = str(info.value)
     assert "Could not write the output store 's3://bucket/out.zarr'" in message
     assert "EndpointConnectionError" in message
-    assert "DST is using anonymous access" in message
+    assert "the output store is using anonymous access" in message
     assert endpoint in message

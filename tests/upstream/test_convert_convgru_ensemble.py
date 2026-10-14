@@ -5,8 +5,8 @@ import of the modules under test.
 
 The tests marked ``irene`` convert the real IRENE checkpoint (``it4lia/irene`` on Hugging
 Face, 770 MB, cached in the Hugging Face cache). They are skipped unless pytest runs with
-``--run-irene`` or ``MLCAST_ICB_IRENE=1``. ``MLCAST_ICB_IRENE_CKPT`` and
-``MLCAST_ICB_IRENE_SAMPLE`` point them at local copies of ``model.ckpt`` and
+``--run-irene`` or ``ICB_TEST_IRENE=1``. ``ICB_TEST_IRENE_CKPT`` and
+``ICB_TEST_IRENE_SAMPLE`` point them at local copies of ``model.ckpt`` and
 ``examples/sample_data.nc`` instead.
 """
 
@@ -130,7 +130,7 @@ def test_unexpected_checkpoint_layouts_are_rejected(tiny_convgru_ensemble_checkp
 
 @pytest.fixture(scope="module")
 def irene_checkpoint() -> Path:
-    return fetch_checkpoint(os.environ.get("MLCAST_ICB_IRENE_CKPT", IRENE_SOURCE))
+    return fetch_checkpoint(os.environ.get("ICB_TEST_IRENE_CKPT", IRENE_SOURCE))
 
 
 @pytest.fixture(scope="module")
@@ -140,7 +140,7 @@ def irene_sample() -> xr.DataArray:
     The file labels ``RR`` as ``kg m-2 s-1``, but its values are mm/h, which is how IRENE
     reads them and how they are used here.
     """
-    path = fetch_checkpoint(os.environ.get("MLCAST_ICB_IRENE_SAMPLE", IRENE_SAMPLE_SOURCE))
+    path = fetch_checkpoint(os.environ.get("ICB_TEST_IRENE_SAMPLE", IRENE_SAMPLE_SOURCE))
     with xr.open_dataset(path) as ds:
         rr = ds["RR"].load()
     y0, x0 = (rr.sizes["y"] - 256) // 2, (rr.sizes["x"] - 256) // 2

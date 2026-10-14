@@ -22,7 +22,7 @@ from loguru import logger
 from mlcast_icb.errors import ConfigError, InputError
 from mlcast_icb.io.storage import storage_error, storage_errors, storage_exceptions
 
-#: Accepted values of a zarr format setting such as a ``ZARR_FORMAT`` variable.
+#: Accepted values of a zarr format setting such as ``--zarr-format``.
 ZARR_FORMATS = ("auto", "2", "3")
 
 #: Written when ``'auto'`` has nothing to follow, or detection fails.
@@ -41,7 +41,7 @@ def open_zarr(uri: str, storage_options: Mapping[str, Any] | None = None) -> xr.
         through fsspec.
     storage_options : mapping, optional
         fsspec options for this store, as built by
-        :func:`~mlcast_icb.io.storage.storage_options` for the ``SRC`` side. ``None``
+        :func:`~mlcast_icb.io.storage.storage_options` for the ``input`` side. ``None``
         or an empty mapping leaves fsspec to pick up ambient environment credentials.
 
     Returns
@@ -79,7 +79,7 @@ def open_zarr(uri: str, storage_options: Mapping[str, Any] | None = None) -> xr.
     except storage_exceptions() as exc:
         # Before ValueError: a few botocore errors (an unknown endpoint or region) are
         # ValueErrors too, and they are storage failures, not a malformed store.
-        raise storage_error("SRC", uri, storage_options, "open", exc) from exc
+        raise storage_error("input", uri, storage_options, "open", exc) from exc
     except (KeyError, ValueError) as exc:
         raise InputError(f"Could not open input store {uri!r}: {exc}") from exc
 
@@ -109,7 +109,7 @@ def load_zarr(ds: xr.Dataset, uri: str, storage_options: Mapping[str, Any] | Non
         chunks are fetched, and the first place a read permission or a flaky endpoint
         can bite.
     """
-    with storage_errors("SRC", uri, storage_options, "read"):
+    with storage_errors("input", uri, storage_options, "read"):
         return ds.load()
 
 
@@ -141,7 +141,7 @@ def detect_zarr_format(uri: str, storage_options: Mapping[str, Any] | None = Non
     return None
 
 
-def parse_zarr_format(value: str | None, key: str = "ZARR_FORMAT") -> ZarrFormat:
+def parse_zarr_format(value: str | None, key: str = "--zarr-format") -> ZarrFormat:
     """Parse a zarr format setting.
 
     Parameters
@@ -149,7 +149,7 @@ def parse_zarr_format(value: str | None, key: str = "ZARR_FORMAT") -> ZarrFormat
     value : str or None
         The raw value; ``None`` or blank means ``'auto'``. Case-insensitive.
     key : str, optional
-        Variable name, used in the error message.
+        Option or variable name, used in the error message.
 
     Returns
     -------
@@ -222,7 +222,7 @@ def write_zarr(
         Destination store.
     storage_options : mapping, optional
         fsspec options for the destination, as built by
-        :func:`~mlcast_icb.io.storage.storage_options` for the ``DST`` side.
+        :func:`~mlcast_icb.io.storage.storage_options` for the ``output`` side.
     zarr_format : {'auto', 2, 3}, optional
         Store format. ``'auto'`` matches ``source_uri`` (see :func:`resolve_zarr_format`).
     source_uri : str, optional
@@ -246,7 +246,7 @@ def write_zarr(
     """
     resolved = resolve_zarr_format(zarr_format, source_uri, source_storage_options)
     logger.info(f"Writing {uri} (zarr format {resolved})")
-    with storage_errors("DST", uri, storage_options, "write"):
+    with storage_errors("output", uri, storage_options, "write"):
         ds.to_zarr(
             uri,
             mode="w",

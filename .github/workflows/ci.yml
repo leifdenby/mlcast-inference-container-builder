@@ -211,7 +211,7 @@ jobs:
     if: needs.setup.outputs.image == 'true'
     runs-on: ubuntu-latest
     env:
-      # The tag the Docker tests look for, through MLCAST_ICB_TEST_BASE_IMAGE.
+      # The tag the Docker tests look for, through ICB_TEST_BASE_IMAGE.
       BASE_IMAGE: mlcast-icb-test-runtime:cpu
     steps:
       - uses: actions/checkout@v7
@@ -278,5 +278,5 @@ jobs:
         # Builds a tiny model image on the base image and checks its labels, `info`, the
         # missing-subcommand exit and `run` against a local run.
         env:
-          MLCAST_ICB_TEST_BASE_IMAGE: ${{ env.BASE_IMAGE }}
+          ICB_TEST_BASE_IMAGE: ${{ env.BASE_IMAGE }}
         run: pytest -q -m docker --run-docker

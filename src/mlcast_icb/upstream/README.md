@@ -422,7 +422,7 @@ padding). Outside the floor, end-to-end mm/h agree to 5e-4.
 **Tests.** Convert a tiny synthetic `convgru_ensemble`-shaped checkpoint; the result loads
 strictly and matches the original forward pass for the same seed. The full IRENE
 conversion runs as a slow, opt-in test (marker `irene`; `pytest --run-irene` or
-`MLCAST_ICB_IRENE=1`; `MLCAST_ICB_IRENE_CKPT` / `MLCAST_ICB_IRENE_SAMPLE` point it at local
+`ICB_TEST_IRENE=1`; `ICB_TEST_IRENE_CKPT` / `ICB_TEST_IRENE_SAMPLE` point it at local
 files, otherwise they come from the Hugging Face cache). FBK's package cannot be a test
 dependency, so it compares the converted network with the raw IRENE weights loaded straight
 into `ConvGruModel` (bit-identical, 2 members × 12 steps on a 256×256 crop of

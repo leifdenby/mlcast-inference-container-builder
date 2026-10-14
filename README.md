@@ -45,38 +45,73 @@ A model that fails either check is never bundled, and the command exits 6.
 ### `info`: show what a bundle is
 
 ```sh
-mlcast-icb info bundle/            # prints manifest.json; the default is $MODEL_DIR, then /model
+mlcast-icb info bundle/            # prints manifest.json; the default is $MLCAST_MODEL_DIR, then /model
 mlcast-icb info bundle/ --verify   # also checks the checksum and loads the model
 ```
 
-### `run`: batch forecast, zarr in and out (Mode 1)
+### Configuring `run` and `serve`
 
-`run` reads `INPUT_ZARR` and writes the forecast to `OUTPUT_ZARR`. It is configured only
-through environment variables:
+`run` and `serve` follow the convention of DMI's MLWP inference containers (as in
+[mlwp-inference-container-anna](https://github.com/dmidk/mlwp-inference-container-anna)),
+with the prefix `MLCAST`. Every command line option `--some-option` can also be set with
+the environment variable `MLCAST_SOME_OPTION`. An option on the command line wins over its
+variable, which wins over the default:
 
 ```sh
-INPUT_ZARR=s3://radar/composite.zarr OUTPUT_ZARR=/data/forecast.zarr DEVICE=cuda mlcast-icb run
+mlcast-icb run --input-zarr s3://radar/composite.zarr --output-zarr /data/forecast.zarr --device cuda
+# or, equivalently
+MLCAST_INPUT_ZARR=s3://radar/composite.zarr MLCAST_OUTPUT_ZARR=/data/forecast.zarr MLCAST_DEVICE=cuda mlcast-icb run
 ```
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `INPUT_ZARR` | **required** | Input store URI: a local path, `s3://…` or `gs://…` |
-| `OUTPUT_ZARR` | **required** | Output store URI. Any existing store there is replaced |
-| `MODEL_DIR` | `/model` | The model bundle |
-| `FORECAST_REFERENCE_TIME` | last time in the input | The last input time, in ISO 8601 (`2026-05-01T12:00Z`). A time without a zone is read as UTC |
-| `FORECAST_STEPS` | the model's | Number of steps to forecast |
-| `ENSEMBLE_SIZE` | the model's | Number of ensemble members |
-| `SEED` | unset | Seed for the ensemble noise. With a seed, runs are reproducible |
-| `DEVICE` | `auto` | `auto`, `cuda` or `cpu`. With `cuda`, a run without a visible GPU exits 4 instead of falling back to CPU |
-| `ZARR_FORMAT` | `auto` | `auto` (same as the input), `2` or `3` |
-| `LOG_LEVEL` | `INFO` | loguru level |
+- Flags take `true`/`false` (also `1`/`0`, `yes`/`no`) from their variable.
+- An empty variable counts as unset.
+- A set `MLCAST_*` variable that matches no option is an error (exit 2), so a misspelling
+  cannot go unnoticed:
+  `unknown environment variable(s) MLCAST_ENSEMBLE_SIZ (did you mean MLCAST_ENSEMBLE_SIZE?)`.
+- `run` and `serve` share one image, and so one environment: a variable of the other
+  command is ignored (and logged at `DEBUG`), not an error. Only names that are an option
+  of neither command fail.
+- The developer commands (`bundle`, `info`, `build`, `build-base`) are configured by their
+  options only. They read no `MLCAST_*` variable, except that `info` defaults to
+  `$MLCAST_MODEL_DIR`, and do not check them.
+- Every value is checked before anything is loaded, and all problems are reported
+  together, in a single error (exit 2), each named as it was given: by its variable or by
+  its option.
+- The log starts with the version, then the effective configuration: every option with
+  its variable name, value and where the value came from (`cli`, `env` or `default`).
+  Credentials are never shown; a `*_STORAGE_OPTIONS` value is logged with its secrets
+  masked.
+- `mlcast-icb run --help` and `mlcast-icb serve --help` list every option with its
+  variable.
 
-The input and output stores are configured separately, through `SRC_*` and `DST_*`
-variables: `*_AWS_PROFILE`, `*_AWS_ACCESS_KEY_ID`, `*_AWS_SECRET_ACCESS_KEY`,
-`*_AWS_SESSION_TOKEN`, `*_S3_ANON`, `*_S3_ENDPOINT_URL` and `*_STORAGE_OPTIONS` (JSON).
-Unprefixed `AWS_PROFILE` and `S3_ENDPOINT_URL` apply to both stores. Access is anonymous
-unless credentials are given. This works the same way as in
-[dummy-mlwp-model](https://github.com/dmidk/dummy-mlwp-model#remote-stores).
+The mapping between options and variables is done by
+[`src/mlcast_icb/envargs.py`](src/mlcast_icb/envargs.py), copied from ANNA's
+container. It only uses the standard library and has nothing mlcast-specific.
+
+### `run`: batch forecast, zarr in and out (Mode 1)
+
+`run` reads the zarr store `--input-zarr` and writes the forecast to `--output-zarr`.
+
+| Option | Environment variable | Default | |
+| --- | --- | --- | --- |
+| `--input-zarr` | `MLCAST_INPUT_ZARR` | (required) | Input store URI: a local path, `s3://…` or `gs://…` |
+| `--output-zarr` | `MLCAST_OUTPUT_ZARR` | (required) | Output store URI. Any existing store there is replaced |
+| `--model-dir` | `MLCAST_MODEL_DIR` | `/model` | The model bundle |
+| `--forecast-reference-time` | `MLCAST_FORECAST_REFERENCE_TIME` | last time in the input | The last input time, in ISO 8601 (`2026-05-01T12:00Z`). A time without a zone is read as UTC |
+| `--forecast-steps` | `MLCAST_FORECAST_STEPS` | the model's | Number of steps to forecast |
+| `--ensemble-size` | `MLCAST_ENSEMBLE_SIZE` | the model's | Number of ensemble members |
+| `--seed` | `MLCAST_SEED` | | Seed for the ensemble noise. With a seed, runs are reproducible |
+| `--device` | `MLCAST_DEVICE` | `auto` (`cuda` in GPU images) | `auto`, `cuda` or `cpu`. With `cuda`, a run without a visible GPU exits 4 instead of falling back to CPU |
+| `--zarr-format` | `MLCAST_ZARR_FORMAT` | `auto` | `auto` (same as the input), `2` or `3` |
+| `--log-level` | `MLCAST_LOG_LEVEL` | `INFO` | loguru level |
+| `--input-aws-profile` | `MLCAST_INPUT_AWS_PROFILE` | (AWS config) | AWS profile for the input store |
+| `--input-s3-endpoint-url` | `MLCAST_INPUT_S3_ENDPOINT_URL` | (AWS config) | S3 endpoint for the input store |
+| `--input-s3-anon` | `MLCAST_INPUT_S3_ANON` | (auto) | `true`: unsigned requests to the input store; `false`: signed. Unset: anonymous unless credentials are found (`--no-input-s3-anon` on the command line for `false`) |
+| `--input-storage-options` | `MLCAST_INPUT_STORAGE_OPTIONS` | | Further fsspec options for the input store, a JSON object merged last |
+| `--output-aws-profile` | `MLCAST_OUTPUT_AWS_PROFILE` | (AWS config) | AWS profile for the output store |
+| `--output-s3-endpoint-url` | `MLCAST_OUTPUT_S3_ENDPOINT_URL` | (AWS config) | S3 endpoint for the output store |
+| `--output-s3-anon` | `MLCAST_OUTPUT_S3_ANON` | (auto) | As `--input-s3-anon`, for the output store |
+| `--output-storage-options` | `MLCAST_OUTPUT_STORAGE_OPTIONS` | | As `--input-storage-options`, for the output store |
 
 The run reads only the variables whose `standard_name` the model uses (plus their grid
 mapping), and only the model's input window, ending at the reference time. It writes
@@ -84,45 +119,98 @@ one variable per input variable, with dimensions `(ensemble_member, time, y, x)`
 `time` coordinate holds valid times, alongside `lead_time` and `forecast_reference_time`
 coordinates. The model's name, version and sha256 are recorded in the store's attributes.
 
-The log starts with the version. Next comes the effective configuration, one line per
-setting with defaults included and credentials never shown, then the bundle's manifest.
-At the end the log reports timings, and peak GPU memory on CUDA. A misspelt variable such
-as `FORECAST_STEP` is logged as a warning that suggests the right name. All configuration
-problems are reported together, in a single error.
+After the effective configuration, the log shows the storage options each store resolved
+to (credentials masked) and the bundle's manifest. At the end it reports timings, and peak
+GPU memory on CUDA.
 
 | Exit code | Meaning |
 | --- | --- |
 | 0 | Success |
 | 1 | Anything unexpected (traceback logged) |
-| 2 | Configuration error |
+| 2 | Configuration error (including an unknown option or `MLCAST_*` variable) |
 | 3 | Input error: the store is missing, or does not match what the model expects |
-| 4 | Device error: `DEVICE=cuda` with no usable GPU |
+| 4 | Device error: `--device cuda` with no usable GPU |
 | 5 | Storage error: a store could not be reached, read or written |
 | 6 | Model error: the bundle is missing or corrupt (rebuild the image) |
+
+#### S3 endpoints and credentials
+
+The input and output stores are configured separately, so they can be on different S3
+hosts with different credentials:
+
+- `--{input,output}-aws-profile` sets the profile (from `~/.aws`) for that store. It also
+  takes precedence over `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` in
+  the environment, which botocore then ignores for that store.
+- `--{input,output}-s3-endpoint-url` sets the endpoint for that store. It is usually
+  better carried by the profile's `endpoint_url` in `~/.aws/config`.
+- Unset, a store uses the usual AWS configuration: `AWS_PROFILE`, the `AWS_*` keys, an IAM
+  role, `AWS_ENDPOINT_URL` / `AWS_ENDPOINT_URL_S3`, or an `endpoint_url` in the profile.
+  Credentials have no options of their own: they come from the environment, a profile or
+  a role.
+- Access is anonymous unless credentials are found: a profile (`--*-aws-profile` or
+  `AWS_PROFILE`), `AWS_*` keys, role credentials, or credentials in `--*-storage-options`.
+  Reading a public bucket then just works. `--*-s3-anon` decides explicitly, e.g.
+  `MLCAST_INPUT_S3_ANON=false` to sign with the `default` profile of `~/.aws/credentials`.
+- `--*-storage-options` reaches any other fsspec/s3fs option (`requester_pays`,
+  `config_kwargs`, a `gs://` project, …) and wins over the options above.
+- A store that cannot be reached exits 5, with a hint naming the `MLCAST_INPUT_*` or
+  `MLCAST_OUTPUT_*` variables that configure it.
+
+For example, reading from one S3 host and writing to another, each with its own profile in
+`~/.aws`:
+
+```ini
+# ~/.aws/config                       # ~/.aws/credentials
+[profile radar-reader]                [radar-reader]
+endpoint_url = https://s3.example.org aws_access_key_id = …
+                                      aws_secret_access_key = …
+[profile forecast-writer]             [forecast-writer]
+endpoint_url = https://s3.dmi.dk      aws_access_key_id = …
+                                      aws_secret_access_key = …
+```
+
+```sh
+MLCAST_INPUT_ZARR=s3://radar/composite.zarr \
+MLCAST_INPUT_AWS_PROFILE=radar-reader \
+MLCAST_OUTPUT_ZARR=s3://nowcasts/latest.zarr \
+MLCAST_OUTPUT_AWS_PROFILE=forecast-writer \
+    mlcast-icb run
+
+# in the container, which runs as the user `model` (uid 1000, home /home/model)
+docker run --rm -v ~/.aws:/home/model/.aws:ro \
+    -e MLCAST_INPUT_ZARR=s3://radar/composite.zarr -e MLCAST_INPUT_AWS_PROFILE=radar-reader \
+    -e MLCAST_OUTPUT_ZARR=s3://nowcasts/latest.zarr -e MLCAST_OUTPUT_AWS_PROFILE=forecast-writer \
+    IMAGE run
+```
+
+Without a config file, give each store its endpoint and the keys in the standard variables:
+`-e AWS_ACCESS_KEY_ID=… -e AWS_SECRET_ACCESS_KEY=… -e MLCAST_INPUT_S3_ENDPOINT_URL=https://s3.example.org
+-e MLCAST_OUTPUT_S3_ENDPOINT_URL=https://s3.dmi.dk`. Keys in the environment apply to every
+store that has no profile of its own.
 
 ### `serve`: HTTP server, netCDF in and out (Mode 2)
 
 `serve` answers forecasts over HTTP. Its API is a superset of the
 [IRENE](https://huggingface.co/it4lia/irene) server, so IRENE clients work unchanged. It
-needs the `serve` extra (FastAPI, uvicorn, prometheus-client), and like `run` it is
-configured only through environment variables:
+needs the `serve` extra (FastAPI, uvicorn, prometheus-client), and it is configured like
+`run`:
 
 ```sh
-MODEL_DIR=bundle/ DEVICE=cpu mlcast-icb serve     # OpenAPI docs at http://localhost:8000/docs
+mlcast-icb serve --model-dir bundle/ --device cpu   # OpenAPI docs at http://localhost:8000/docs
 ```
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `MODEL_DIR` | `/model` | The model bundle |
-| `DEVICE` | `auto` | `auto`, `cuda` or `cpu`, as for `run` |
-| `HOST` | `0.0.0.0` | Address to bind |
-| `PORT` | `8000` | Port to bind |
-| `MAX_UPLOAD_MB` | `100` | Largest upload; larger ones get 413 |
-| `MAX_QUEUE` | `2` | Predictions that may wait while one runs; more get 429 with `Retry-After` |
-| `REQUEST_TIMEOUT` | unset | Seconds a prediction may wait for the model before it gets 503 with `Retry-After`. Unset waits indefinitely |
-| `MAX_FORECAST_STEPS` | `48` | Upper limit of `forecast_steps` (IRENE: 48) |
-| `MAX_ENSEMBLE_SIZE` | `10` | Upper limit of `ensemble_size` (IRENE: 10) |
-| `LOG_LEVEL` | `INFO` | loguru level |
+| Option | Environment variable | Default | |
+| --- | --- | --- | --- |
+| `--model-dir` | `MLCAST_MODEL_DIR` | `/model` | The model bundle |
+| `--device` | `MLCAST_DEVICE` | `auto` (`cuda` in GPU images) | `auto`, `cuda` or `cpu`, as for `run` |
+| `--host` | `MLCAST_HOST` | `0.0.0.0` | Address to bind |
+| `--port` | `MLCAST_PORT` | `8000` | Port to bind |
+| `--max-upload-mb` | `MLCAST_MAX_UPLOAD_MB` | `100` | Largest upload; larger ones get 413 |
+| `--max-queue` | `MLCAST_MAX_QUEUE` | `2` | Predictions that may wait while one runs; more get 429 with `Retry-After` |
+| `--request-timeout` | `MLCAST_REQUEST_TIMEOUT` | | Seconds a prediction may wait for the model before it gets 503 with `Retry-After`. Unset waits indefinitely |
+| `--max-forecast-steps` | `MLCAST_MAX_FORECAST_STEPS` | `48` | Upper limit of `forecast_steps` (IRENE: 48) |
+| `--max-ensemble-size` | `MLCAST_MAX_ENSEMBLE_SIZE` | `10` | Upper limit of `ensemble_size` (IRENE: 10) |
+| `--log-level` | `MLCAST_LOG_LEVEL` | `INFO` | loguru level |
 
 Startup works as it does for `run`. The log starts with the version, then the effective
 configuration, then the bundle. A configuration error exits 2, an unusable device exits 4
@@ -143,8 +231,8 @@ exits 1. After the port is bound, one warm-up forecast runs in the background.
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `variable` | `RR` | Input variable. If it is not given: with `format=irene`, `RR` is tried first, then the variable with the model's `standard_name`; with `format=cf`, the order is reversed |
-| `forecast_steps` | the model's | 1 to `MAX_FORECAST_STEPS` |
-| `ensemble_size` | the model's | 1 to `MAX_ENSEMBLE_SIZE` |
+| `forecast_steps` | the model's | 1 to `--max-forecast-steps` |
+| `ensemble_size` | the model's | 1 to `--max-ensemble-size` |
 | `format` | `irene` | `irene` gives IRENE's bare layout. `cf` gives the CF-complete forecast |
 | `products` | `members` | `format=cf` only. A comma-separated subset of `members`, `mean`, `quantiles` and `exceedance` |
 | `quantiles` | `0.1,0.5,0.9` | Levels for `products=quantiles` |
@@ -248,13 +336,16 @@ started without one prints the usage and exits 2:
 
 ```sh
 docker run --rm IMAGE info --verify
-docker run --rm -v "$PWD/data:/data" -e INPUT_ZARR=/data/in.zarr -e OUTPUT_ZARR=/data/out.zarr IMAGE run
+docker run --rm -v "$PWD/data:/data" -e MLCAST_INPUT_ZARR=/data/in.zarr -e MLCAST_OUTPUT_ZARR=/data/out.zarr IMAGE run
+docker run --rm -v "$PWD/data:/data" IMAGE run --input-zarr /data/in.zarr --output-zarr /data/out.zarr   # the same
 docker run --rm -p 8000:8000 IMAGE serve
 ```
 
-Containers run as uid 1000, so a mounted output directory must be writable by it. GPU
-variants set `DEVICE=cuda`, so a GPU image started without a GPU exits 4. Pass
-`--gpus all`, or `-e DEVICE=cpu` to run it on CPU anyway.
+Containers run as the user `model` (uid 1000, home `/home/model`), so a mounted output
+directory must be writable by it, and `~/.aws` is mounted at `/home/model/.aws`. The image
+sets `MLCAST_MODEL_DIR=/model`. GPU variants set `MLCAST_DEVICE=cuda`, so a GPU image
+started without a GPU exits 4. Pass `--gpus all`, or `-e MLCAST_DEVICE=cpu` (or
+`run --device cpu`) to run it on CPU anyway.
 
 There is no Docker `HEALTHCHECK`. Kubernetes ignores it, so probe `serve` with
 liveness/readiness probes on `/healthz` and `/readyz` instead.
@@ -299,12 +390,13 @@ what torch was built against. The CUDA libraries themselves come from torch's
 Each builder release corresponds to one mlcast version, and so does each base image; see
 [Pinned mlcast version](#pinned-mlcast-version).
 
-`pytest --run-docker` (or `MLCAST_ICB_DOCKER=1`) also runs the Docker tests. They build
+`pytest --run-docker` (or `ICB_TEST_DOCKER=1`) also runs the Docker tests. They build
 the cpu base image and a tiny model image on it, then check `info`, the labels and the
 missing-subcommand exit, and that `run` in the container matches a local run. The base
 build takes about 4 minutes cold and seconds from cache. With
-`MLCAST_ICB_TEST_BASE_IMAGE=<image>` they use that already built cpu base image instead,
-as CI does.
+`ICB_TEST_BASE_IMAGE=<image>` they use that already built cpu base image instead,
+as CI does. (The tests' own switches start with `ICB_TEST_`, never `MLCAST_`: the
+application would reject an unknown `MLCAST_*` variable.)
 
 ## Development
 
