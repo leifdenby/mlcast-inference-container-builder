@@ -42,3 +42,8 @@ ready-to-run inference image out.
 - CI (lint, tests on Python 3.11 and the container's Python, the IRENE tests on main and
   weekly, the Docker tests when the image's inputs change), base image publishing to
   ghcr.io on version tags, and Dependabot for GitHub Actions, uv and the Docker bases.
+
+### Dependencies
+
+- `[actions/cache](https://github.com/actions/cache)`: 5 → 6 ([#1](https://github.com/leifdenby/mlcast-inference-container-builder/pull/1))
+
