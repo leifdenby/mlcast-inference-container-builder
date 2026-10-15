@@ -5,6 +5,43 @@ Turns a trained [mlcast](https://github.com/mlcast-community/mlcast) nowcasting 
 offers two modes: `run` (batch, zarr in/out on S3) and `serve` (an HTTP server compatible
 with the IRENE API).
 
+```mermaid
+flowchart LR
+    subgraph build["Build time: mlcast-icb bundle / build"]
+        direction TB
+        ckpt[/"Lightning checkpoint<br/>model.ckpt"/]
+        cfg[/"Fiddle training config<br/>config.yaml"/]
+        bundle["Model bundle<br/>/model: model.ckpt + manifest.json"]
+        image[("Inference image<br/>runtime base + bundle")]
+        ckpt --> bundle
+        cfg --> bundle
+        bundle --> image
+    end
+
+    subgraph run["Mode 1: run (batch)"]
+        direction TB
+        zin[/"Input zarr, local or s3://<br/>past radar frames, CF standard_name<br/>e.g. rainfall_rate (time, y, x)"/]
+        envr[/"MLCAST_* variables or CLI options<br/>forecast steps, ensemble size, seed"/]
+        crun["mlcast-icb run"]
+        zout[\"Output zarr, local or s3://<br/>(ensemble_member, time, y, x)<br/>+ lead_time, forecast_reference_time, CRS"\]
+        zin --> crun
+        envr --> crun
+        crun --> zout
+    end
+
+    subgraph serve["Mode 2: serve (HTTP)"]
+        direction TB
+        req[/"POST /predict<br/>netCDF upload + query params<br/>forecast_steps, ensemble_size, format, products"/]
+        cserve["mlcast-icb serve<br/>IRENE-compatible API"]
+        resp[\"netCDF response<br/>IRENE layout or full CF;<br/>members, mean, quantiles, exceedance"\]
+        req --> cserve
+        cserve --> resp
+    end
+
+    image --> crun
+    image --> cserve
+```
+
 Status: working prototype, not yet released. Model bundles (`bundle`, `info`), the batch
 mode (`run`), the HTTP server (`serve`) and the image builds (`build-base`, `build`) all
 work and are tested, including in Docker and on the real IRENE checkpoint. Base images
