@@ -47,3 +47,6 @@ ready-to-run inference image out.
 
 - `[actions/cache](https://github.com/actions/cache)`: 5 → 6 ([#1](https://github.com/leifdenby/mlcast-inference-container-builder/pull/1))
 
+- `huggingface-hub`: 2.2.0 → 2.3.0 ([#2](https://github.com/leifdenby/mlcast-inference-container-builder/pull/2))
+- `ruff`: 0.17.0 → 0.17.2 ([#2](https://github.com/leifdenby/mlcast-inference-container-builder/pull/2))
+- `fastapi`: 0.143.0 → 0.162.0 ([#2](https://github.com/leifdenby/mlcast-inference-container-builder/pull/2))
